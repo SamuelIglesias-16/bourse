@@ -4,10 +4,10 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
 
 from bourse.db import get_connection, DB_PATH
 from bourse.models import Listing
+from bourse.normalize import normalize_brand, normalize_size
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,8 @@ def ingest(listings: list[Listing], query: str = "") -> IngestSummary:
     if not listings:
         return summary
 
+    listings = [_normalize_listing(listing) for listing in listings]
+
     if query:
         before = len(listings)
         listings = [l for l in listings if _matches_query(l, query)]
@@ -84,6 +86,16 @@ def ingest(listings: list[Listing], query: str = "") -> IngestSummary:
             summary.total_snapshots += 1
 
     return summary
+
+
+def _normalize_listing(listing: Listing) -> Listing:
+    """Return a copy with brand/size normalized before filtering or writes."""
+    return listing.model_copy(
+        update={
+            "brand": normalize_brand(listing.brand),
+            "size": normalize_size(listing.size),
+        }
+    )
 
 
 def _upsert_listing(

@@ -9,6 +9,7 @@ import typer
 from bourse.db import DB_PATH, get_connection, init_db
 from bourse.ingest import ingest, PRICE_MIN, PRICE_MAX
 from bourse.plick import scrape_query as scrape_plick
+from bourse.tradera import scrape_query as scrape_tradera
 from bourse.vinted import scrape_query as scrape_vinted
 from bourse.report import print_report
 
@@ -127,6 +128,47 @@ def scrape_vinted_cmd(
         typer.echo(str(summary))
 
 
+# ── scrape tradera ────────────────────────────────────────────────────────
+
+
+@scrape_app.command("tradera")
+def scrape_tradera_cmd(
+    query: Optional[str] = typer.Argument(
+        None, help="Search query, e.g. 'acne studios'. Omit when using --watchlist."
+    ),
+    watchlist: bool = typer.Option(
+        False, "--watchlist", help="Read queries from watchlist.txt and scrape all."
+    ),
+    pages: int = typer.Option(5, "--pages", help="Search result pages to fetch per query."),
+) -> None:
+    """Scrape Tradera for one query or for every query in watchlist.txt."""
+    if watchlist and query:
+        typer.echo("Error: provide either a query argument or --watchlist, not both.", err=True)
+        raise typer.Exit(code=1)
+    if not watchlist and not query:
+        typer.echo("Error: provide a query argument or --watchlist.", err=True)
+        raise typer.Exit(code=1)
+
+    queries = _read_watchlist() if watchlist else [query]  # type: ignore[list-item]
+
+    if not queries:
+        typer.echo("Watchlist is empty. Add queries with: bourse watchlist add \"query\"")
+        raise typer.Exit()
+
+    init_db()
+
+    for q in queries:
+        typer.echo(f"\nScraping Tradera for: {q!r}")
+        listings = scrape_tradera(q, pages=pages)
+
+        if not listings:
+            typer.echo("  No listings found.")
+            continue
+
+        summary = ingest(listings, query=q)
+        typer.echo(str(summary))
+
+
 # ── scrape all (both platforms) ────────────────────────────────────────────
 
 
@@ -138,7 +180,7 @@ def scrape_all(
     ),
     pages: int = typer.Option(5, "--pages", help="Search result pages to fetch per query per platform."),
 ) -> None:
-    """Scrape both Plick and Vinted for every query in watchlist.txt."""
+    """Scrape Plick, Vinted and Tradera for every query in watchlist.txt."""
     queries = _read_watchlist()
     if not queries:
         typer.echo(
@@ -151,7 +193,11 @@ def scrape_all(
 
     for q in queries:
         typer.echo(f"\n── {q!r} ──")
-        for platform_name, scraper in [("Plick", scrape_plick), ("Vinted", scrape_vinted)]:
+        for platform_name, scraper in [
+            ("Plick", scrape_plick),
+            ("Vinted", scrape_vinted),
+            ("Tradera", scrape_tradera),
+        ]:
             typer.echo(f"\n  Scraping {platform_name}…")
             listings = scraper(q, pages=pages)
             if not listings:
@@ -288,3 +334,19 @@ def db_clean_prices() -> None:
         conn.execute(f"DELETE FROM listings WHERE listing_id IN ({ph})", ids)
 
     typer.echo(f"Deleted {len(rows)} listings and their snapshots.")
+
+
+@db_app.command("backfill-brands")
+def db_backfill_brands() -> None:
+    """Normalize brand field for all listings in Postgres."""
+    from bourse.backfill import backfill_brands
+    updated = backfill_brands()
+    typer.echo(f"Updated {updated} listing(s) with normalized brand values.")
+
+
+@db_app.command("backfill-sizes")
+def db_backfill_sizes() -> None:
+    """Normalize size field for all listings in Postgres."""
+    from bourse.backfill import backfill_sizes
+    updated = backfill_sizes()
+    typer.echo(f"Updated {updated} listing(s) with normalized size values.")

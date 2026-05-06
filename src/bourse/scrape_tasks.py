@@ -15,6 +15,14 @@ from bourse.models import Listing
 import bourse.plick as plick
 import bourse.vinted as vinted
 
+try:
+    import bourse.tradera as tradera
+    _tradera_available = True
+except Exception:
+    tradera = None  # type: ignore[assignment]
+    _tradera_available = False
+    logging.getLogger(__name__).warning("tradera module unavailable — will be skipped")
+
 load_dotenv()  # no-op on Railway; picks up .env locally
 logger = logging.getLogger(__name__)
 WATCHLIST_FILE = Path("watchlist.txt")
@@ -163,9 +171,12 @@ def run_scrape_new() -> None:
 
         now = datetime.now()
         total = 0
+        _new_scrapers = [plick.scrape_query_new_only, vinted.scrape_query_new_only]
+        if _tradera_available:
+            _new_scrapers.append(tradera.scrape_query_new_only)
         for query in queries:
             query_count = 0
-            for scraper in [plick.scrape_query_new_only, vinted.scrape_query_new_only]:
+            for scraper in _new_scrapers:
                 try:
                     listings = scraper(query, known_ids)
                 except Exception:
@@ -246,6 +257,9 @@ def run_scrape_update() -> None:
                     price, likes, is_gone = plick.fetch_listing(url)
                 elif listing_id.startswith("vinted:"):
                     price, likes, is_gone = vinted.fetch_listing(listing_id)
+                elif listing_id.startswith("tradera:"):
+                    logger.debug("scrape/update: tradera fetch_listing not yet implemented, skipping %s", listing_id)
+                    continue
                 else:
                     logger.warning("scrape/update: unknown platform for %s", listing_id)
                     continue
