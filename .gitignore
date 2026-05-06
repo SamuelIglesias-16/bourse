@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Environment variables
+.env
+.env.*
+
+# Database
+bourse.db
+
+# Scraper cache
+.cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+scrape.log
+*.log
+
+# Claude Code
+.claude/
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
