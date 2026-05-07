@@ -77,6 +77,7 @@ def test_send_telegram_warns_and_returns_without_env(
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.setattr(alerts, "load_dotenv", lambda: None)
     monkeypatch.setattr(alerts.httpx, "post", fake_post)
 
     with caplog.at_level("WARNING"):
@@ -194,4 +195,83 @@ def test_check_alerts_uses_zero_and_dash_for_missing_fields(
         "Size: -\n"
         "Likes: 0\n"
         "https://example.com/listing/1"
+    ]
+
+
+def test_inactive_alerts_are_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(alerts, "DB_PATH", tmp_path / "inactive.db")
+    sent: list[str] = []
+    monkeypatch.setattr(alerts, "send_telegram", sent.append)
+    _ensure_alerts_table()
+
+    with alerts.get_connection(alerts.DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO price_alerts (category, size, max_price, active)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("jeans", "m", 1000, 0),
+        )
+
+    alerts.check_alerts([_listing()])
+
+    assert sent == []
+
+
+def test_alert_without_category_matches_any_listing_under_price(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(alerts, "DB_PATH", tmp_path / "any-category.db")
+    sent: list[str] = []
+    monkeypatch.setattr(alerts, "send_telegram", sent.append)
+    _ensure_alerts_table()
+
+    with alerts.get_connection(alerts.DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO price_alerts (category, size, max_price, active)
+            VALUES (?, ?, ?, ?)
+            """,
+            (None, "m", 1000, 1),
+        )
+
+    alerts.check_alerts([_listing(title="Maison Margiela trench coat")])
+
+    assert sent == [
+        "🔔 PRICE ALERT\n"
+        "Maison Margiela trench coat — 900kr\n"
+        "Platform: vinted\n"
+        "Size: M\n"
+        "Likes: 3\n"
+        "https://example.com/listing/1"
+    ]
+
+
+@pytest.mark.xfail(reason="check_alerts currently sends notifications but does not return matched alerts")
+def test_check_alerts_returns_list_of_matched_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(alerts, "DB_PATH", tmp_path / "return-value.db")
+    sent: list[str] = []
+    monkeypatch.setattr(alerts, "send_telegram", sent.append)
+    _ensure_alerts_table()
+
+    with alerts.get_connection(alerts.DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO price_alerts (category, size, max_price, active)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("jeans", "m", 1000, 1),
+        )
+
+    matched = alerts.check_alerts([_listing()])
+
+    assert matched == [
+        {"category": "jeans", "size": "m", "max_price": 1000, "active": 1}
     ]

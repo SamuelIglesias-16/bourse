@@ -121,6 +121,56 @@ def _write_to_pg(listings: list[Listing]) -> None:
         ingest(listings, query="")
 
 
+# ── Watchlist Postgres store ──────────────────────────────────────────────────
+
+def ensure_watchlist_table() -> None:
+    """Create watchlist table in Postgres; seed from watchlist.txt on first run."""
+    with pg_write() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    id    SERIAL PRIMARY KEY,
+                    query TEXT UNIQUE NOT NULL
+                )
+            """)
+            cur.execute("SELECT COUNT(*) AS n FROM watchlist")
+            if cur.fetchone()["n"] == 0 and WATCHLIST_FILE.exists():
+                lines = [l.strip() for l in WATCHLIST_FILE.read_text(encoding="utf-8").splitlines()
+                         if l.strip() and not l.startswith("#")]
+                for q in lines:
+                    cur.execute("INSERT INTO watchlist (query) VALUES (%s) ON CONFLICT DO NOTHING", (q,))
+                if lines:
+                    logger.info("Seeded %d watchlist queries from watchlist.txt", len(lines))
+
+
+def pg_read_watchlist() -> list[str]:
+    """Read watchlist queries from Postgres; fall back to watchlist.txt on error."""
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT query FROM watchlist ORDER BY id")
+                return [r["query"] for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("pg_read_watchlist: Postgres unavailable (%s) — reading from file", exc)
+        return _read_watchlist()
+
+
+def pg_watchlist_add(query: str) -> bool:
+    """Insert query into Postgres watchlist. Returns True if inserted, False if duplicate."""
+    with pg_write() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO watchlist (query) VALUES (%s) ON CONFLICT DO NOTHING", (query,))
+            return cur.rowcount > 0
+
+
+def pg_watchlist_remove(query: str) -> bool:
+    """Delete query from Postgres watchlist. Returns True if deleted, False if not found."""
+    with pg_write() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM watchlist WHERE query = %s", (query,))
+            return cur.rowcount > 0
+
+
 # ── Watchlist run tracking ────────────────────────────────────────────────────
 
 def ensure_watchlist_runs_table() -> None:
@@ -165,7 +215,7 @@ def _upsert_watchlist_run(query: str, now: datetime, listings_found: int | None)
 def run_scrape_new() -> None:
     """Scrape each watchlist query, saving only listing IDs not already in Postgres."""
     try:
-        queries = _read_watchlist()
+        queries = pg_read_watchlist()
         if not queries:
             logger.info("scrape/new: watchlist is empty")
             return
@@ -271,8 +321,11 @@ def run_scrape_update() -> None:
                 elif listing_id.startswith("vinted:"):
                     price, likes, is_gone = vinted.fetch_listing(listing_id)
                 elif listing_id.startswith("tradera:"):
-                    logger.debug("scrape/update: tradera fetch_listing not yet implemented, skipping %s", listing_id)
-                    continue
+                    if not _tradera_available:
+                        logger.debug("scrape/update: tradera unavailable, skipping %s", listing_id)
+                        continue
+                    _p, _l = tradera.fetch_listing(listing_id, url)
+                    price, likes, is_gone = _p, _l, (_p is None)
                 else:
                     logger.warning("scrape/update: unknown platform for %s", listing_id)
                     continue
@@ -287,7 +340,7 @@ def run_scrape_update() -> None:
             except Exception:
                 logger.exception("scrape/update: failed for %s", listing_id)
         logger.info("scrape/update complete: %d updated, %d removed", updated, removed)
-        for query in _read_watchlist():
+        for query in pg_read_watchlist():
             _upsert_watchlist_run(query, now, listings_found=None)
     except Exception:
         logger.exception("scrape/update: unhandled error, task aborted")

@@ -3,7 +3,6 @@
 import logging
 import os
 import subprocess
-from pathlib import Path
 from typing import Any, Optional
 
 import psycopg2.extras
@@ -16,7 +15,16 @@ from bourse.alert_routes import router as alerts_router
 from bourse.ingest import PRICE_MIN, PRICE_MAX
 from bourse.report import _detect_category
 from bourse.pg_report import load_report_data
-from bourse.scrape_tasks import pg_read, run_scrape_new, run_scrape_update, ensure_watchlist_runs_table
+from bourse.scrape_tasks import (
+    pg_read,
+    run_scrape_new,
+    run_scrape_update,
+    ensure_watchlist_runs_table,
+    ensure_watchlist_table,
+    pg_read_watchlist,
+    pg_watchlist_add,
+    pg_watchlist_remove,
+)
 
 load_dotenv()  # no-op on Railway (env vars already set); picks up .env locally
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s — %(message)s")
@@ -28,9 +36,11 @@ if not os.environ.get("DATABASE_URL"):
         "Set it as an environment variable or add it to a .env file in the project root."
     )
 
-ensure_watchlist_runs_table()
-
-WATCHLIST_FILE = Path("watchlist.txt")
+try:
+    ensure_watchlist_runs_table()
+    ensure_watchlist_table()
+except Exception:
+    logger.warning("Startup: could not ensure watchlist tables — DB may not be ready yet")
 
 app = FastAPI(title="Bourse API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -39,23 +49,9 @@ app.include_router(alerts_router)
 
 # ── watchlist ────────────────────────────────────────────────────────────────
 
-def _read_watchlist() -> list[str]:
-    if not WATCHLIST_FILE.exists():
-        return []
-    return [
-        line.strip()
-        for line in WATCHLIST_FILE.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-
-
-def _write_watchlist(queries: list[str]) -> None:
-    WATCHLIST_FILE.write_text("\n".join(queries) + ("\n" if queries else ""), encoding="utf-8")
-
-
 @app.get("/watchlist")
 def get_watchlist() -> list[dict[str, Any]]:
-    queries = _read_watchlist()
+    queries = pg_read_watchlist()
     if not queries:
         return []
     try:
@@ -85,21 +81,19 @@ class WatchlistItem(BaseModel):
 
 @app.post("/watchlist", status_code=201)
 def add_watchlist_item(item: WatchlistItem) -> dict[str, Any]:
-    queries = _read_watchlist()
-    if item.query in queries:
+    inserted = pg_watchlist_add(item.query)
+    if not inserted:
         raise HTTPException(409, "Query already in watchlist")
-    queries.append(item.query)
-    _write_watchlist(queries)
+    queries = pg_read_watchlist()
     return {"query": item.query, "total": len(queries)}
 
 
 @app.delete("/watchlist/{item}")
 def remove_watchlist_item(item: str) -> dict[str, Any]:
-    queries = _read_watchlist()
-    if item not in queries:
+    deleted = pg_watchlist_remove(item)
+    if not deleted:
         raise HTTPException(404, "Query not found in watchlist")
-    queries.remove(item)
-    _write_watchlist(queries)
+    queries = pg_read_watchlist()
     return {"removed": item, "remaining": len(queries)}
 
 

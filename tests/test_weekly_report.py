@@ -45,6 +45,17 @@ def test_render_html_contains_dark_and_orange_sections() -> None:
     assert "42" in html
 
 
+def test_render_html_contains_expected_sections() -> None:
+    html = weekly_report._render_html(_sample_data())
+
+    assert "Secondhand market pulse" in html
+    assert "New Listings" in html
+    assert "Top Brand" in html
+    assert "Stale Listings" in html
+    assert "Acne Studios jacket" in html
+    assert "Margiela jeans" in html
+
+
 def test_fetch_weekly_data_aggregates_query_results(monkeypatch: pytest.MonkeyPatch) -> None:
     executed: list[str] = []
 
@@ -170,3 +181,80 @@ def test_send_weekly_report_logs_and_skips_without_email_env(
     assert not called
     assert "would have sent weekly report" in caplog.text
     assert "Weekly report HTML" in caplog.text
+
+
+def test_fetch_weekly_data_handles_empty_database_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCursor:
+        def __enter__(self) -> FakeCursor:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def execute(self, sql: str) -> None:
+            return None
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return []
+
+        def fetchone(self):
+            return None
+
+    class FakeConn:
+        def __enter__(self) -> FakeConn:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(weekly_report.psycopg2, "connect", lambda *args, **kwargs: FakeConn())
+
+    data = weekly_report._fetch_weekly_data("postgres://example")
+    html = weekly_report._render_html(data)
+
+    assert data["top_new"] == []
+    assert data["price_drops"] == []
+    assert data["top_brand"] == {"brand": "unknown", "new_listings": 0}
+    assert data["total_new"] == 0
+    assert data["stale_count"] == 0
+    assert html.count("No data this week.") == 2
+
+
+def test_send_weekly_report_subject_line_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: dict[str, object] = {}
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int) -> None:
+            return None
+
+        def __enter__(self) -> FakeSMTP:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def starttls(self) -> None:
+            return None
+
+        def login(self, username: str, password: str) -> None:
+            return None
+
+        def send_message(self, message: EmailMessage) -> None:
+            sent["subject"] = message["Subject"]
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("EMAIL_FROM", "from@example.com")
+    monkeypatch.setenv("EMAIL_TO", "to@example.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "secret")
+    monkeypatch.setattr(weekly_report, "_fetch_weekly_data", lambda _: _sample_data())
+    monkeypatch.setattr(weekly_report.smtplib, "SMTP", FakeSMTP)
+
+    weekly_report.send_weekly_report()
+
+    assert sent["subject"] == "Bourse Weekly Report"

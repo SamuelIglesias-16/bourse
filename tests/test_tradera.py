@@ -1,12 +1,16 @@
 import json
 from datetime import datetime
 
+import pytest
+
 from bourse.tradera import (
     _parse_brand_from_title,
     _parse_detail_page,
+    _parse_item,
     _parse_search_page,
     _parse_size_from_title,
     fetch_listing,
+    scrape_query,
 )
 
 
@@ -215,5 +219,147 @@ def test_fetch_listing_returns_none_when_gone(monkeypatch) -> None:
             return FakeResponse()
 
     monkeypatch.setattr("bourse.tradera.httpx.Client", FakeClient)
+
+    assert fetch_listing("tradera:729980753", "https://www.tradera.com/item/340303/729980753") == (None, None)
+
+
+@pytest.mark.xfail(reason="Tradera scraper does not yet apply the ingest price sanity filter itself")
+def test_price_sanity_filter_rejects_under_200kr_and_over_50000kr() -> None:
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    low = _parse_item(
+        {
+            "itemId": 1,
+            "price": 199,
+            "shortDescription": "Cheap Acne Studios tee",
+            "itemUrl": "https://example.com/1",
+            "totalBids": 0,
+            "sellerAlias": "samuel",
+            "startDate": "2026-05-03T21:10:13.0080000Z",
+            "attributes": [],
+        },
+        1,
+        now,
+    )
+    high = _parse_item(
+        {
+            "itemId": 2,
+            "price": 50001,
+            "shortDescription": "Expensive Acne Studios coat",
+            "itemUrl": "https://example.com/2",
+            "totalBids": 0,
+            "sellerAlias": "samuel",
+            "startDate": "2026-05-03T21:10:13.0080000Z",
+            "attributes": [],
+        },
+        2,
+        now,
+    )
+
+    assert low is None
+    assert high is None
+
+
+def test_pagination_works_for_page_2_plus(monkeypatch) -> None:
+    urls: list[str] = []
+    page1 = _search_html(
+        [
+            {
+                "itemId": 1,
+                "price": 300,
+                "shortDescription": "Acne Studios tee",
+                "itemUrl": "https://www.tradera.com/item/1",
+                "itemType": "Auction",
+                "totalBids": 1,
+                "sellerAlias": "samuel",
+                "startDate": "2026-05-03T21:10:13.0080000Z",
+                "attributes": [{"name": "brand", "values": ["Acne Studios"]}],
+            }
+        ],
+        page_count=2,
+    )
+    page2 = _search_html(
+        [
+            {
+                "itemId": 2,
+                "price": 400,
+                "shortDescription": "Maison Margiela jeans",
+                "itemUrl": "https://www.tradera.com/item/2",
+                "itemType": "Auction",
+                "totalBids": 2,
+                "sellerAlias": "samuel",
+                "startDate": "2026-05-03T21:10:13.0080000Z",
+                "attributes": [{"name": "brand", "values": ["Maison Margiela"]}],
+            }
+        ],
+        page_count=2,
+    )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.headers = kwargs.get("headers", {}).copy()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_fetch(client, url: str) -> str:
+        urls.append(url)
+        if "paging=1" in url:
+            return page1
+        return page2
+
+    monkeypatch.setattr("bourse.tradera.httpx.Client", FakeClient)
+    monkeypatch.setattr("bourse.tradera._fetch", fake_fetch)
+
+    listings = scrape_query("acne studios", pages=2)
+
+    assert [listing.listing_id for listing in listings] == ["tradera:1", "tradera:2"]
+    assert [listing.position_in_search for listing in listings] == [1, 2]
+    assert urls == [
+        "https://www.tradera.com/search?q=acne+studios&paging=1",
+        "https://www.tradera.com/search?q=acne+studios&paging=2",
+    ]
+
+
+def test_fetch_listing_returns_none_for_ended_auction(monkeypatch) -> None:
+    html = _detail_html(
+        item_details={
+            "itemId": 729980753,
+            "openingBid": 360,
+            "buyNowPrice": None,
+            "hasEnded": True,
+            "isActive": False,
+            "isFinalized": True,
+            "forciblyClosed": False,
+        },
+        bid_info={"leadingBidAmount": 360, "bidCount": 3},
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.headers = kwargs.get("headers", {}).copy()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, timeout: int) -> FakeResponse:
+            return FakeResponse(html)
+
+    monkeypatch.setattr("bourse.tradera.httpx.Client", FakeClient)
+    monkeypatch.setattr("bourse.tradera.time.sleep", lambda *_: None)
 
     assert fetch_listing("tradera:729980753", "https://www.tradera.com/item/340303/729980753") == (None, None)

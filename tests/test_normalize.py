@@ -49,3 +49,30 @@ def test_normalize_size_variants() -> None:
 
     for raw, expected in cases:
         assert normalize_size(raw) == expected
+
+
+def test_normalize_requested_extra_cases() -> None:
+    brand_cases = [
+        ("masion margiela", "maison margiela"),
+        ("maison marginal", "maison margiela"),
+        ("acne jeans", "acne studios"),
+        ("—", ""),
+        (None, ""),
+        ("", ""),
+        ("stockholm", "acne studios"),
+        ("mm6 maison margiela", "mm6"),
+        ("supreme", "supreme"),
+    ]
+    size_cases = [
+        ("W32 L34", "W32 L34"),
+        ("43", "43"),
+        ("one size", "ONE SIZE"),
+        ("XXS", "XXS"),
+        ("50", "50"),
+        ("L/M", "L/M"),
+    ]
+
+    for raw, expected in brand_cases:
+        assert normalize_brand(raw) == expected
+    for raw, expected in size_cases:
+        assert normalize_size(raw) == expected

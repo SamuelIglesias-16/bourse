@@ -117,13 +117,20 @@ Same schema as SQLite with these differences:
 - `listing_snapshots.id` is `SERIAL PRIMARY KEY` (not `AUTOINCREMENT`)
 - All timestamps stored as native `TIMESTAMP` (not ISO strings)
 
-Additional table created automatically at API startup:
+Additional tables created automatically at API startup:
 ```sql
 CREATE TABLE IF NOT EXISTS watchlist_runs (
     query          TEXT PRIMARY KEY,
     last_run_at    TIMESTAMP NOT NULL,
     listings_found INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    id    SERIAL PRIMARY KEY,
+    query TEXT UNIQUE NOT NULL
+);
+-- Seeded from watchlist.txt on first boot (when table is empty).
+-- This is the source of truth on Railway; watchlist.txt is kept as a fallback.
 ```
 
 ---
@@ -151,19 +158,26 @@ Both functions accept `str | None` and always return `str`.
 
 ---
 
-## Watchlist format
+## Watchlist
 
-`watchlist.txt` at the project root. One query per line. Lines starting with `#` are comments.
+**Source of truth on Railway: Postgres `watchlist` table** (created at API startup).  
+**Source of truth locally: `watchlist.txt`** (one query per line, `#` for comments).
 
+On first Railway deploy, the `watchlist` table is seeded from `watchlist.txt` if it's empty. After that, `watchlist.txt` is only read as a fallback when Postgres is unreachable.
+
+The scraping tasks (`run_scrape_new`, `run_scrape_update`) call `pg_read_watchlist()`, which reads from Postgres and falls back to `watchlist.txt`.
+
+**CLI** still writes to `watchlist.txt` (local dev only):
+```bash
+bourse watchlist add "maison margiela gats"
+bourse watchlist remove "acne studios hoodie"
 ```
-maison margiela gats
-maison margiela
-acne studios
-acne studios hoodie
-acne studios longsleeve
-```
 
-Managed via `bourse watchlist add/remove` CLI or `POST/DELETE /watchlist` API.
+**API** reads/writes Postgres `watchlist` table:
+```
+POST   /watchlist    {query: str}  → adds to Postgres
+DELETE /watchlist/{query}          → removes from Postgres
+```
 
 ---
 
@@ -290,7 +304,7 @@ All report data uses only active listings with sane prices (200–50,000 SEK).
 
 ### New listings flow (`POST /scrape/new` or `bourse scrape all`)
 
-1. Read `watchlist.txt` → list of query strings
+1. Read watchlist via `pg_read_watchlist()` (Postgres → falls back to `watchlist.txt`)
 2. Fetch all known `listing_id`s from Postgres (to skip already-seen listings)
 3. For each query:
    - **Plick**: fetch HTML search pages via httpx, parse with selectolax, extract cards → fetch detail page for each new card (condition, material, likes, seller_rating, price from JSON-LD)
@@ -306,7 +320,8 @@ All report data uses only active listings with sane prices (200–50,000 SEK).
 2. For each listing:
    - **Plick**: `GET {url}` → parse detail page → extract current price + likes
    - **Vinted**: `GET /api/v2/items/{item_id}` → extract price + likes
-   - If 404/410: mark listing `status = 'removed'`
+   - **Tradera**: `GET {url}` → parse `__NEXT_DATA__` JSON → extract price + bid count; `(None, None)` return → mark removed
+   - If 404/410 or `None` price: mark listing `status = 'removed'`
    - Else: insert new snapshot row with current price/likes
 3. Upsert `watchlist_runs` for all watchlist queries (timestamp only, preserve `listings_found`)
 
@@ -415,9 +430,9 @@ pytest tests/
 
 ### Immediate next tasks
 
-1. **`tradera.fetch_listing()`** — Tradera is scraped for new listings but not yet updated (no `fetch_listing` in `tradera.py`). Tradera listings are silently skipped in `run_scrape_update`. Implement it to unlock update support.
-2. **Railway cron** — set up Railway's cron to call `POST /scrape/new` daily and `POST /scrape/update` every few hours
-3. **Postgres `clean-prices` command** — equivalent of `bourse db clean-prices` but targets the live Postgres DB
+1. **Railway cron** — set up Railway's cron to call `POST /scrape/new` daily and `POST /scrape/update` every few hours
+2. **Postgres `clean-prices` command** — equivalent of `bourse db clean-prices` but targets the live Postgres DB
+3. **`price_alerts` to Postgres** — currently `alerts.py` uses SQLite (`bourse.db`). On Railway, `bourse.db` is not persisted across deploys. Move price alerts to the Postgres DB so they survive redeployment.
 
 ---
 
