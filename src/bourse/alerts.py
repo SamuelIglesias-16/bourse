@@ -6,6 +6,7 @@ import logging
 import os
 
 import httpx
+from dotenv import load_dotenv
 
 from bourse.db import DB_PATH, get_connection
 from bourse.models import Listing
@@ -89,6 +90,7 @@ def _format_alert_message(listing: Listing) -> str:
 
 def send_telegram(message: str) -> None:
     """Send a Telegram message if bot credentials are configured."""
+    load_dotenv()
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -106,6 +108,7 @@ def send_telegram(message: str) -> None:
 
 def check_alerts(new_listings: list[Listing]) -> None:
     """Check incoming listings against active price alerts and notify matches."""
+    load_dotenv()
     if not new_listings:
         _ensure_price_alerts_table()
         return

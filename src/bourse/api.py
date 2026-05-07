@@ -12,6 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from bourse.alert_routes import router as alerts_router
 from bourse.ingest import PRICE_MIN, PRICE_MAX
 from bourse.report import _detect_category
 from bourse.pg_report import load_report_data
@@ -33,6 +34,7 @@ WATCHLIST_FILE = Path("watchlist.txt")
 
 app = FastAPI(title="Bourse API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(alerts_router)
 
 
 # ── watchlist ────────────────────────────────────────────────────────────────

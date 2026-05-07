@@ -23,9 +23,11 @@ app = typer.Typer(help="Bourse — secondhand fashion market intelligence.")
 scrape_app = typer.Typer(help="Scrape platforms.")
 watchlist_app = typer.Typer(help="Manage the search watchlist.")
 db_app = typer.Typer(help="Database utilities.")
+alerts_app = typer.Typer(help="Manage price alerts.")
 app.add_typer(scrape_app, name="scrape")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(db_app, name="db")
+app.add_typer(alerts_app, name="alerts")
 
 WATCHLIST_FILE = Path("watchlist.txt")
 
@@ -334,6 +336,93 @@ def db_clean_prices() -> None:
         conn.execute(f"DELETE FROM listings WHERE listing_id IN ({ph})", ids)
 
     typer.echo(f"Deleted {len(rows)} listings and their snapshots.")
+
+
+# ── alerts ────────────────────────────────────────────────────────────────────
+
+
+@alerts_app.command("test-telegram")
+def alerts_test_telegram() -> None:
+    """Send a test message to Telegram to verify bot credentials."""
+    from bourse.alerts import send_telegram
+    send_telegram("🤖 Bourse bot is connected and working!")
+    typer.echo("Test message sent.")
+
+
+@alerts_app.command("list")
+def alerts_list() -> None:
+    """List all active price alerts."""
+    from bourse.alerts import _ensure_price_alerts_table
+    _ensure_price_alerts_table()
+    with get_connection(DB_PATH) as conn:
+        try:
+            conn.execute("ALTER TABLE price_alerts ADD COLUMN query TEXT")
+        except Exception:
+            pass
+        rows = conn.execute(
+            "SELECT id, query, category, size, max_price FROM price_alerts"
+            " WHERE active = 1 ORDER BY id"
+        ).fetchall()
+    if not rows:
+        typer.echo("No active alerts.")
+        return
+    for r in rows:
+        d = dict(r)
+        parts = [f"#{d['id']}"]
+        if d.get("query"):
+            parts.append(repr(d["query"]))
+        parts.append(f"max {d['max_price']:,} SEK")
+        if d.get("category"):
+            parts.append(d["category"])
+        if d.get("size"):
+            parts.append(f"size {d['size']}")
+        typer.echo("  ".join(parts))
+
+
+@alerts_app.command("add")
+def alerts_add(
+    query: str = typer.Argument(..., help="Search query this alert covers."),
+    max_price: int = typer.Option(..., "--max-price", help="Fire when price is below this (SEK)."),
+    category: Optional[str] = typer.Option(None, "--category", help="Category filter (hoodie, jeans…)."),
+    size: Optional[str] = typer.Option(None, "--size", help="Size filter (e.g. M, L, 42)."),
+) -> None:
+    """Add a new price alert."""
+    from bourse.alerts import _ensure_price_alerts_table
+    _ensure_price_alerts_table()
+    with get_connection(DB_PATH) as conn:
+        try:
+            conn.execute("ALTER TABLE price_alerts ADD COLUMN query TEXT")
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO price_alerts (query, category, size, max_price) VALUES (?, ?, ?, ?)",
+            (query, category, size, max_price),
+        )
+    label = f"{query!r}  max {max_price:,} SEK"
+    if category:
+        label += f"  category={category}"
+    if size:
+        label += f"  size={size}"
+    typer.echo(f"Alert added: {label}")
+
+
+@alerts_app.command("remove")
+def alerts_remove(
+    alert_id: int = typer.Argument(..., help="ID of the alert to deactivate."),
+) -> None:
+    """Deactivate a price alert by ID."""
+    from bourse.alerts import _ensure_price_alerts_table
+    _ensure_price_alerts_table()
+    with get_connection(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE price_alerts SET active = 0 WHERE id = ? AND active = 1",
+            (alert_id,),
+        )
+        affected = cur.rowcount
+    if affected == 0:
+        typer.echo(f"Alert #{alert_id} not found or already inactive.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"Alert #{alert_id} deactivated.")
 
 
 @db_app.command("backfill-brands")

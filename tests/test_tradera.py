@@ -1,7 +1,13 @@
 import json
 from datetime import datetime
 
-from bourse.tradera import _parse_brand_from_title, _parse_search_page, _parse_size_from_title
+from bourse.tradera import (
+    _parse_brand_from_title,
+    _parse_detail_page,
+    _parse_search_page,
+    _parse_size_from_title,
+    fetch_listing,
+)
 
 
 def _search_html(items: list[dict], page_count: int = 3) -> str:
@@ -12,6 +18,32 @@ def _search_html(items: list[dict], page_count: int = 3) -> str:
                     "discover": {
                         "items": items,
                         "pagination": {"pageCount": page_count},
+                    }
+                }
+            }
+        }
+    }
+    return (
+        "<html><body>"
+        f"<script id='__NEXT_DATA__' type='application/json'>{json.dumps(payload)}</script>"
+        "</body></html>"
+    )
+
+
+def _detail_html(
+    *,
+    item_details: dict | None = None,
+    bid_info: dict | None = None,
+) -> str:
+    payload = {
+        "props": {
+            "pageProps": {
+                "initialState": {
+                    "views": {
+                        "viewItem": {
+                            "itemDetails": item_details or {},
+                            "bidInfo": bid_info or {},
+                        }
                     }
                 }
             }
@@ -77,3 +109,111 @@ def test_parse_size_from_title_falls_back_conservatively() -> None:
     assert _parse_size_from_title("Acne Studios loafers 41") == "41"
     assert _parse_size_from_title("MM6 dress size one size") == "ONE SIZE"
     assert _parse_size_from_title("Vintage trench coat") is None
+
+
+def test_parse_detail_page_extracts_current_price_and_bid_count() -> None:
+    html = _detail_html(
+        item_details={
+            "itemId": 729915729,
+            "title": "Acne Studios",
+            "openingBid": 350,
+            "buyNowPrice": None,
+            "hasEnded": False,
+            "isActive": True,
+            "isFinalized": False,
+            "forciblyClosed": False,
+        },
+        bid_info={
+            "leadingBidAmount": 350,
+            "bidCount": 1,
+        },
+    )
+
+    assert _parse_detail_page(html) == (350, 1)
+
+
+def test_parse_detail_page_returns_none_for_ended_listing() -> None:
+    html = _detail_html(
+        item_details={
+            "itemId": 729915729,
+            "openingBid": 350,
+            "hasEnded": True,
+            "isActive": False,
+            "isFinalized": True,
+            "forciblyClosed": False,
+        },
+        bid_info={"leadingBidAmount": 350, "bidCount": 4},
+    )
+
+    assert _parse_detail_page(html) == (None, None)
+
+
+def test_fetch_listing_bypasses_cache_and_parses_html(monkeypatch) -> None:
+    html = _detail_html(
+        item_details={
+            "itemId": 729980753,
+            "openingBid": 360,
+            "buyNowPrice": None,
+            "hasEnded": False,
+            "isActive": True,
+            "isFinalized": False,
+            "forciblyClosed": False,
+        },
+        bid_info={"leadingBidAmount": 0, "bidCount": 0},
+    )
+    requested: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.headers = kwargs.get("headers", {}).copy()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, timeout: int) -> FakeResponse:
+            requested.append(url)
+            return FakeResponse(html)
+
+    monkeypatch.setattr("bourse.tradera.httpx.Client", FakeClient)
+    monkeypatch.setattr("bourse.tradera.time.sleep", lambda *_: None)
+
+    assert fetch_listing("tradera:729980753", "https://www.tradera.com/item/340303/729980753") == (360, 0)
+    assert requested == ["https://www.tradera.com/item/340303/729980753"]
+
+
+def test_fetch_listing_returns_none_when_gone(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 404
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.headers = kwargs.get("headers", {}).copy()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, timeout: int) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr("bourse.tradera.httpx.Client", FakeClient)
+
+    assert fetch_listing("tradera:729980753", "https://www.tradera.com/item/340303/729980753") == (None, None)

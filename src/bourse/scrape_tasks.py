@@ -23,6 +23,12 @@ except Exception:
     _tradera_available = False
     logging.getLogger(__name__).warning("tradera module unavailable — will be skipped")
 
+try:
+    from bourse.alerts import check_alerts as _check_alerts
+except Exception:
+    _check_alerts = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("alerts module unavailable — check_alerts disabled")
+
 load_dotenv()  # no-op on Railway; picks up .env locally
 logger = logging.getLogger(__name__)
 WATCHLIST_FILE = Path("watchlist.txt")
@@ -171,6 +177,7 @@ def run_scrape_new() -> None:
 
         now = datetime.now()
         total = 0
+        all_new: list[Listing] = []
         _new_scrapers = [plick.scrape_query_new_only, vinted.scrape_query_new_only]
         if _tradera_available:
             _new_scrapers.append(tradera.scrape_query_new_only)
@@ -185,10 +192,16 @@ def run_scrape_new() -> None:
                 if listings:
                     _write_to_pg(listings)
                     known_ids.update(l.listing_id for l in listings)
+                    all_new.extend(listings)
                     query_count += len(listings)
                     total += len(listings)
             _upsert_watchlist_run(query, now, listings_found=query_count)
         logger.info("scrape/new complete: %d new listings", total)
+        if _check_alerts is not None and all_new:
+            try:
+                _check_alerts(all_new)
+            except Exception:
+                logger.exception("check_alerts raised an error")
     except Exception:
         logger.exception("scrape/new: unhandled error, task aborted")
 

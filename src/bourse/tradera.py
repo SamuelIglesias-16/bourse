@@ -234,6 +234,34 @@ def _parse_search_page(html: str, position_offset: int, now: datetime) -> tuple[
     return listings, int(page_count)
 
 
+def _parse_detail_page(html: str) -> tuple[int | None, int | None]:
+    data = _extract_next_data(html)
+    view_item = data["props"]["pageProps"]["initialState"]["views"]["viewItem"]
+    item_details = view_item.get("itemDetails") or {}
+    bid_info = view_item.get("bidInfo") or {}
+    if not item_details:
+        return None, None
+
+    if (
+        item_details.get("hasEnded")
+        or item_details.get("isFinalized")
+        or item_details.get("forciblyClosed")
+        or not item_details.get("isActive", True)
+    ):
+        return None, None
+
+    likes_raw = bid_info.get("bidCount")
+    likes = int(likes_raw) if likes_raw is not None else None
+
+    price_raw = bid_info.get("leadingBidAmount")
+    if price_raw in (None, 0, "0", ""):
+        price_raw = item_details.get("buyNowPrice") or item_details.get("openingBid")
+    if price_raw in (None, ""):
+        return None, likes
+
+    return int(float(price_raw)), likes
+
+
 def scrape_query(query: str, pages: int = 5) -> list[Listing]:
     """Scrape Tradera search results for *query* across *pages* pages."""
     now = datetime.now()
@@ -299,3 +327,26 @@ def scrape_query_new_only(query: str, known_ids: set[str], max_pages: int = 20) 
                 break
 
     return result
+
+
+def fetch_listing(listing_id: str, url: str) -> tuple[int | None, int | None]:
+    """Re-fetch a single Tradera listing page. Returns (price_sek, likes)."""
+    with httpx.Client(
+        follow_redirects=True,
+        headers={"Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8"},
+    ) as client:
+        client.headers["User-Agent"] = random.choice(USER_AGENTS)
+        try:
+            resp = client.get(url, timeout=15)
+        except httpx.RequestError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if resp.status_code in (404, 410):
+            return None, None
+        resp.raise_for_status()
+
+    time.sleep(random.uniform(2, 4))
+    try:
+        return _parse_detail_page(resp.text)
+    except Exception:
+        logger.warning("Could not parse Tradera detail page for %s", listing_id)
+        return None, None
