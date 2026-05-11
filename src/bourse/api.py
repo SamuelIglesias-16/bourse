@@ -117,6 +117,13 @@ def trigger_scrape_update(bg: BackgroundTasks) -> dict[str, str]:
     return {"status": "accepted", "message": "Scrape-update job started — rechecks existing active listings"}
 
 
+PLATFORM_BASE_URLS = {
+    "plick": "https://www.plick.se",
+    "vinted": "https://www.vinted.se",
+    "tradera": "https://www.tradera.com",
+}
+
+
 # ── listings ─────────────────────────────────────────────────────────────────
 
 @app.get("/listings")
@@ -172,6 +179,8 @@ def get_listings(
         r["category"] = _detect_category(r["title"])
         r["first_seen"] = r["first_seen"].isoformat() if r["first_seen"] else None
         r["last_seen"] = r["last_seen"].isoformat() if r["last_seen"] else None
+        if not r.get("url"):
+            r["url"] = PLATFORM_BASE_URLS.get(r["platform"], "")
 
     if category:
         rows = [r for r in rows if r["category"] == category]
@@ -183,7 +192,10 @@ def _fetch_keyword_listings(q: str) -> list[dict[str, Any]]:
     keywords = [kw for kw in q.split() if kw]
     if not keywords:
         return []
-    or_clauses = " OR ".join(
+    # 3+ words = require ALL (precise: "maison margiela gats" shouldn't return every margiela);
+    # 1-2 words = ANY (broader recall, e.g. "acne studios").
+    joiner = " AND " if len(keywords) >= 3 else " OR "
+    keyword_clauses = joiner.join(
         "(l.title ILIKE %s OR COALESCE(l.brand, '') ILIKE %s)" for _ in keywords
     )
     params: list[Any] = []
@@ -201,7 +213,7 @@ def _fetch_keyword_listings(q: str) -> list[dict[str, Any]]:
                (EXTRACT(EPOCH FROM NOW() - l.first_seen) / 86400)::INTEGER AS days_on_market,
                l.first_seen, l.last_seen
           FROM listings l JOIN latest lt ON lt.listing_id = l.listing_id
-         WHERE l.status = 'active' AND ({or_clauses})
+         WHERE l.status = 'active' AND ({keyword_clauses})
          ORDER BY l.first_seen DESC
     """
     try:
@@ -216,6 +228,8 @@ def _fetch_keyword_listings(q: str) -> list[dict[str, Any]]:
         r["category"] = _detect_category(r["title"])
         r["first_seen"] = r["first_seen"].isoformat() if r["first_seen"] else None
         r["last_seen"] = r["last_seen"].isoformat() if r["last_seen"] else None
+        if not r.get("url"):
+            r["url"] = PLATFORM_BASE_URLS.get(r["platform"], "")
     return rows
 
 
@@ -226,7 +240,9 @@ def get_listings_by_query(q: str) -> list[dict[str, Any]]:
 
 @app.get("/listings/by-query/stats")
 def get_listings_by_query_stats(q: str) -> dict[str, Any]:
-    rows = [r for r in _fetch_keyword_listings(q) if PRICE_MIN <= r["price_sek"] <= PRICE_MAX]
+    # Tighter ceiling than PRICE_MAX (50_000): bud/joke listings and rare luxury outliers
+    # skew the avg/max for stats. 15_000 covers virtually all real secondhand fashion.
+    rows = [r for r in _fetch_keyword_listings(q) if PRICE_MIN <= r["price_sek"] <= 15_000]
     if not rows:
         return {
             "total_listings": 0,
@@ -251,6 +267,43 @@ def get_listings_by_query_stats(q: str) -> dict[str, Any]:
     }
 
 
+@app.get("/listings/{listing_id}")
+def get_listing(listing_id: str) -> dict[str, Any]:
+    # Registered AFTER /listings/by-query* so those literal paths match first.
+    sql = """
+        WITH latest AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek, likes
+              FROM listing_snapshots
+             WHERE listing_id = %s
+             ORDER BY listing_id, scraped_at DESC
+        )
+        SELECT l.listing_id, l.platform, l.url, l.title,
+               COALESCE(l.brand, '—') AS brand, l.size, l.condition,
+               lt.price_sek, COALESCE(lt.likes, 0) AS likes, l.status,
+               (EXTRACT(EPOCH FROM NOW() - l.first_seen) / 86400)::INTEGER AS days_on_market,
+               l.first_seen, l.last_seen
+          FROM listings l JOIN latest lt ON lt.listing_id = l.listing_id
+         WHERE l.listing_id = %s
+    """
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (listing_id, listing_id))
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("GET /listings/{listing_id} query failed")
+        raise HTTPException(500, "Database query failed — check server logs")
+    if not row:
+        raise HTTPException(404, "Listing not found")
+    r = dict(row)
+    r["category"] = _detect_category(r["title"])
+    r["first_seen"] = r["first_seen"].isoformat() if r["first_seen"] else None
+    r["last_seen"] = r["last_seen"].isoformat() if r["last_seen"] else None
+    if not r.get("url"):
+        r["url"] = PLATFORM_BASE_URLS.get(r["platform"], "")
+    return r
+
+
 @app.get("/listings/{listing_id}/history")
 def get_listing_history(listing_id: str) -> list[dict[str, Any]]:
     with pg_read() as conn:
@@ -270,8 +323,125 @@ def get_listing_history(listing_id: str) -> list[dict[str, Any]]:
     return result
 
 
+# ── stats ────────────────────────────────────────────────────────────────────
+
+@app.get("/stats")
+def get_stats() -> dict[str, Any]:
+    sql = """
+        WITH first_prices AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek
+              FROM listing_snapshots ORDER BY listing_id, scraped_at ASC
+        ),
+        latest_prices AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek
+              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
+        )
+        SELECT
+            (SELECT COUNT(*) FROM listings) AS total_listings,
+            (SELECT COUNT(*) FROM listings WHERE first_seen >= CURRENT_DATE) AS new_today,
+            (SELECT COUNT(*)
+               FROM listings l
+               JOIN first_prices f  ON f.listing_id  = l.listing_id
+               JOIN latest_prices lp ON lp.listing_id = l.listing_id
+              WHERE l.status = 'active' AND lp.price_sek < f.price_sek
+            ) AS active_price_drops,
+            (SELECT MAX(last_run_at) FROM watchlist_runs) AS last_scraped_at,
+            (SELECT CASE WHEN COUNT(*) > 0
+                         THEN ROUND(100.0 * SUM(CASE WHEN status = 'sold' THEN 1 ELSE 0 END) / COUNT(*), 1)
+                         ELSE 0.0 END
+               FROM listings) AS avg_sell_through_pct
+    """
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                row = dict(cur.fetchone())
+    except Exception:
+        logger.exception("GET /stats query failed")
+        return {
+            "total_listings": 0,
+            "new_today": 0,
+            "active_price_drops": 0,
+            "avg_sell_through_pct": 0.0,
+            "last_scraped_at": None,
+        }
+    last_scraped_at = row["last_scraped_at"]
+    return {
+        "total_listings": row["total_listings"] or 0,
+        "new_today": row["new_today"] or 0,
+        "active_price_drops": row["active_price_drops"] or 0,
+        "avg_sell_through_pct": float(row["avg_sell_through_pct"] or 0.0),
+        "last_scraped_at": last_scraped_at.isoformat() if last_scraped_at else None,
+    }
+
+
+# ── platforms ────────────────────────────────────────────────────────────────
+
+@app.get("/platforms/compare")
+def get_platforms_compare(q: str) -> dict[str, Any]:
+    keywords = [kw for kw in q.split() if kw]
+    if not keywords:
+        raise HTTPException(400, "q parameter required and must not be empty")
+
+    # Same matching rule as /listings/by-query: AND for precise multi-word queries.
+    joiner = " AND " if len(keywords) >= 3 else " OR "
+    keyword_clauses = joiner.join(
+        "(l.title ILIKE %s OR COALESCE(l.brand, '') ILIKE %s)" for _ in keywords
+    )
+    params: list[Any] = []
+    for kw in keywords:
+        pat = f"%{kw}%"
+        params.extend([pat, pat])
+
+    sql = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek
+              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
+        )
+        SELECT
+            l.platform,
+            COUNT(*) AS count,
+            ROUND(AVG(lt.price_sek))::INTEGER AS avg_price,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS median_price,
+            MIN(lt.price_sek) AS min_price,
+            MAX(lt.price_sek) AS max_price
+          FROM listings l
+          JOIN latest lt ON lt.listing_id = l.listing_id
+         WHERE l.status = 'active'
+           AND lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}
+           AND ({keyword_clauses})
+         GROUP BY l.platform
+        HAVING COUNT(*) >= 3
+         ORDER BY count DESC
+    """
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        logger.exception("GET /platforms/compare query failed")
+        raise HTTPException(500, "Database query failed — check server logs")
+
+    return {
+        "query": q,
+        "total_listings": sum(r["count"] for r in rows),
+        "platforms": rows,
+    }
+
+
 # ── report ───────────────────────────────────────────────────────────────────
 
 @app.get("/report")
 def get_report() -> dict[str, Any]:
-    return load_report_data()
+    try:
+        return load_report_data()
+    except Exception:
+        logger.exception("GET /report failed — returning empty report")
+        return {
+            "sell_through_by_brand": [],
+            "best_day_to_list": [],
+            "avg_price_by_category": [],
+            "like_velocity": [],
+            "top_liked": [],
+        }
