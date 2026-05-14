@@ -142,6 +142,13 @@ def _parse_item(item: dict, position: int, now: datetime) -> Optional[Listing]:
             except (TypeError, ValueError, OSError):
                 pass
 
+        # Image: prefer high-res URL when present, fall back to the standard URL field
+        image_url = (
+            (photo.get("high_resolution") or {}).get("url")
+            or photo.get("url")
+            or photo.get("full_size_url")
+        )
+
         return Listing(
             listing_id=f"vinted:{item_id}",
             platform="vinted",
@@ -159,6 +166,7 @@ def _parse_item(item: dict, position: int, now: datetime) -> Optional[Listing]:
             views=None,
             position_in_search=position,
             scraped_at=now,
+            image_url=image_url,
         )
     except Exception:
         logger.exception("Error parsing Vinted item id=%s", item.get("id"))

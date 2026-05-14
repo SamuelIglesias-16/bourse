@@ -202,6 +202,7 @@ def _parse_item(item: dict[str, Any], position: int, now: datetime) -> Optional[
         likes = int(likes_raw) if likes_raw is not None else None
         url = item.get("itemUrl", f"{BASE_URL}/item/{item_id}")
         seller_name = item.get("sellerAlias") or "unknown"
+        image_url = _extract_image(item)
 
         return Listing(
             listing_id=f"tradera:{item_id}",
@@ -220,10 +221,32 @@ def _parse_item(item: dict[str, Any], position: int, now: datetime) -> Optional[
             views=None,
             position_in_search=position,
             scraped_at=now,
+            image_url=image_url,
         )
     except Exception:
         logger.exception("Error parsing Tradera item id=%s", item.get("itemId"))
         return None
+
+
+def _extract_image(item: dict[str, Any]) -> Optional[str]:
+    """Pull the first item image from a Tradera search-page JSON object.
+
+    Tradera's NEXT_DATA exposes images under several names depending on the
+    response shape — we try the most common ones in order.
+    """
+    for key in ("imageUrls", "images", "imageUrl", "thumbnail", "thumbnailUrl"):
+        value = item.get(key)
+        if isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, str):
+                return first
+            if isinstance(first, dict):
+                for k in ("url", "src", "uri"):
+                    if isinstance(first.get(k), str):
+                        return first[k]
+        elif isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _parse_search_page(html: str, position_offset: int, now: datetime) -> tuple[list[Listing], int]:

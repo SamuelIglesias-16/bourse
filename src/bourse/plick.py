@@ -126,6 +126,7 @@ def _parse_search_page(html: str) -> list[dict]:
             title = alt.split(" - ")[0].strip() if " - " in alt else alt.strip()
             if not title:
                 continue
+            image_url = (img.attrs.get("src") or img.attrs.get("data-src")) if img else None
 
             footer = card.css_first("div.listing-card-component__footer")
             rows = footer.css("div.row") if footer else []
@@ -163,6 +164,7 @@ def _parse_search_page(html: str) -> list[dict]:
                     "size": size or None,
                     "seller_name": seller_name,
                     "price_sek": price_sek,
+                    "image_url": image_url,
                 }
             )
         except Exception:
@@ -267,6 +269,7 @@ def _scrape_one_page(
             seller_name=card["seller_name"], seller_rating=detail.get("seller_rating"),
             posted_at=None, price_sek=card["price_sek"], likes=detail.get("likes"),
             views=None, position_in_search=position_offset + i + 1, scraped_at=now,
+            image_url=card.get("image_url"),
         ))
     return listings
 
