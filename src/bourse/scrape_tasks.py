@@ -3,7 +3,7 @@
 import logging
 import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Generator
 
@@ -24,6 +24,14 @@ except Exception:
     logging.getLogger(__name__).warning("tradera module unavailable — will be skipped")
 
 try:
+    import bourse.blocket as blocket
+    _blocket_available = True
+except Exception:
+    blocket = None  # type: ignore[assignment]
+    _blocket_available = False
+    logging.getLogger(__name__).warning("blocket module unavailable — will be skipped")
+
+try:
     from bourse.alerts import check_alerts as _check_alerts
 except Exception:
     _check_alerts = None  # type: ignore[assignment]
@@ -33,6 +41,11 @@ load_dotenv()  # no-op on Railway; picks up .env locally
 logger = logging.getLogger(__name__)
 WATCHLIST_FILE = Path("watchlist.txt")
 _CONNECT_TIMEOUT = 10  # seconds before psycopg2.connect() gives up
+
+_pg_failure_count = 0
+_pg_backoff_until: datetime | None = None
+_PG_BACKOFF_THRESHOLD = 3
+_PG_BACKOFF_MINUTES = 10
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
@@ -69,19 +82,22 @@ def pg_write() -> Generator[psycopg2.extensions.connection, None, None]:  # type
 
 
 def _upsert_listing(cur: Any, listing: Listing) -> None:
+    import json as _json
+    raw_blob = _json.dumps(listing.raw_extras) if listing.raw_extras else "{}"
     cur.execute(
         """INSERT INTO listings
                (listing_id, platform, url, title, brand, size, condition, material,
-                seller_name, seller_rating, posted_at, first_seen, last_seen, status, raw)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active','{}')
+                seller_name, seller_rating, posted_at, first_seen, last_seen, status, raw, image_url)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
            ON CONFLICT (listing_id) DO UPDATE
                SET last_seen     = EXCLUDED.last_seen,
                    condition     = COALESCE(EXCLUDED.condition, listings.condition),
-                   seller_rating = COALESCE(EXCLUDED.seller_rating, listings.seller_rating)""",
+                   seller_rating = COALESCE(EXCLUDED.seller_rating, listings.seller_rating),
+                   image_url     = COALESCE(EXCLUDED.image_url, listings.image_url)""",
         (listing.listing_id, listing.platform, listing.url, listing.title,
          listing.brand, listing.size, listing.condition, listing.material,
          listing.seller_name, listing.seller_rating, listing.posted_at,
-         listing.scraped_at, listing.scraped_at),
+         listing.scraped_at, listing.scraped_at, raw_blob, listing.image_url),
     )
 
 
@@ -143,15 +159,48 @@ def ensure_watchlist_table() -> None:
                     logger.info("Seeded %d watchlist queries from watchlist.txt", len(lines))
 
 
+def ensure_listing_columns() -> None:
+    """Idempotent migration: add columns added after the original schema."""
+    with pg_write() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_url TEXT")
+
+
 def pg_read_watchlist() -> list[str]:
-    """Read watchlist queries from Postgres; fall back to watchlist.txt on error."""
+    """Read watchlist queries from Postgres; fall back to watchlist.txt on error.
+
+    After 3 consecutive failures, skips Postgres for 10 minutes to avoid
+    flooding Supabase's circuit breaker.
+    """
+    global _pg_failure_count, _pg_backoff_until
+
+    now = datetime.now()
+    if _pg_backoff_until is not None and now < _pg_backoff_until:
+        remaining = int((_pg_backoff_until - now).total_seconds() / 60)
+        logger.warning("pg_read_watchlist: in backoff, %d min remaining — reading from file", remaining)
+        return _read_watchlist()
+
     try:
         with pg_read() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT query FROM watchlist ORDER BY id")
-                return [r["query"] for r in cur.fetchall()]
+                result = [r["query"] for r in cur.fetchall()]
+        _pg_failure_count = 0
+        _pg_backoff_until = None
+        return result
     except Exception as exc:
-        logger.warning("pg_read_watchlist: Postgres unavailable (%s) — reading from file", exc)
+        _pg_failure_count += 1
+        logger.warning(
+            "pg_read_watchlist: Postgres unavailable (%s) — failure %d/%d",
+            exc, _pg_failure_count, _PG_BACKOFF_THRESHOLD,
+        )
+        if _pg_failure_count >= _PG_BACKOFF_THRESHOLD:
+            _pg_backoff_until = now + timedelta(minutes=_PG_BACKOFF_MINUTES)
+            logger.warning(
+                "pg_read_watchlist: %d consecutive failures — backing off for %d minutes",
+                _pg_failure_count, _PG_BACKOFF_MINUTES,
+            )
+            _pg_failure_count = 0
         return _read_watchlist()
 
 
@@ -231,6 +280,8 @@ def run_scrape_new() -> None:
         _new_scrapers = [plick.scrape_query_new_only, vinted.scrape_query_new_only]
         if _tradera_available:
             _new_scrapers.append(tradera.scrape_query_new_only)
+        if _blocket_available:
+            _new_scrapers.append(blocket.scrape_query_new_only)
         for query in queries:
             query_count = 0
             for scraper in _new_scrapers:
@@ -325,6 +376,12 @@ def run_scrape_update() -> None:
                         logger.debug("scrape/update: tradera unavailable, skipping %s", listing_id)
                         continue
                     _p, _l = tradera.fetch_listing(listing_id, url)
+                    price, likes, is_gone = _p, _l, (_p is None)
+                elif listing_id.startswith("blocket:"):
+                    if not _blocket_available:
+                        logger.debug("scrape/update: blocket unavailable, skipping %s", listing_id)
+                        continue
+                    _p, _l = blocket.fetch_listing(listing_id, url)
                     price, likes, is_gone = _p, _l, (_p is None)
                 else:
                     logger.warning("scrape/update: unknown platform for %s", listing_id)

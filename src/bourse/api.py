@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from bourse.alert_routes import router as alerts_router
+from bourse.compare import compute_arbitrage_signal, confidence_tier
 from bourse.ingest import PRICE_MIN, PRICE_MAX
 from bourse.report import _detect_category
 from bourse.pg_report import load_report_data
@@ -21,6 +22,7 @@ from bourse.scrape_tasks import (
     run_scrape_update,
     ensure_watchlist_runs_table,
     ensure_watchlist_table,
+    ensure_listing_columns,
     pg_read_watchlist,
     pg_watchlist_add,
     pg_watchlist_remove,
@@ -39,6 +41,7 @@ if not os.environ.get("DATABASE_URL"):
 try:
     ensure_watchlist_runs_table()
     ensure_watchlist_table()
+    ensure_listing_columns()
 except Exception:
     logger.warning("Startup: could not ensure watchlist tables — DB may not be ready yet")
 
@@ -121,6 +124,7 @@ PLATFORM_BASE_URLS = {
     "plick": "https://www.plick.se",
     "vinted": "https://www.vinted.se",
     "tradera": "https://www.tradera.com",
+    "blocket": "https://www.blocket.se",
 }
 
 
@@ -377,13 +381,157 @@ def get_stats() -> dict[str, Any]:
 
 # ── platforms ────────────────────────────────────────────────────────────────
 
+
 @app.get("/platforms/compare")
-def get_platforms_compare(q: str) -> dict[str, Any]:
+def get_platforms_compare(
+    q: str,
+    condition: Optional[str] = None,
+    size: Optional[str] = None,
+    brand: Optional[str] = None,
+    days: int = 90,
+) -> dict[str, Any]:
     keywords = [kw for kw in q.split() if kw]
     if not keywords:
         raise HTTPException(400, "q parameter required and must not be empty")
+    if days <= 0:
+        raise HTTPException(400, "days must be positive")
 
-    # Same matching rule as /listings/by-query: AND for precise multi-word queries.
+    joiner = " AND " if len(keywords) >= 3 else " OR "
+    keyword_clauses = joiner.join(
+        "(l.title ILIKE %s OR COALESCE(l.brand, '') ILIKE %s)" for _ in keywords
+    )
+
+    filter_clauses = [
+        "l.status = 'active'",
+        f"lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}",
+        f"l.first_seen >= NOW() - INTERVAL '{int(days)} days'",
+        f"({keyword_clauses})",
+    ]
+    base_params: list[Any] = []
+    for kw in keywords:
+        pat = f"%{kw}%"
+        base_params.extend([pat, pat])
+
+    if condition:
+        filter_clauses.append("LOWER(COALESCE(l.condition, '')) = %s")
+        base_params.append(condition.lower())
+    if size:
+        filter_clauses.append("LOWER(COALESCE(l.size, '')) = %s")
+        base_params.append(size.lower())
+    if brand:
+        filter_clauses.append("LOWER(COALESCE(l.brand, '')) = %s")
+        base_params.append(brand.lower())
+
+    where_sql = " AND ".join(filter_clauses)
+
+    aggregates_sql = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek, likes, scraped_at
+              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
+        )
+        SELECT
+            l.platform,
+            COUNT(*) AS count,
+            ROUND(AVG(lt.price_sek))::INTEGER AS avg_price,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS median_price,
+            (PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS p25,
+            (PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS p75,
+            MIN(lt.price_sek) AS min_price,
+            MAX(lt.price_sek) AS max_price,
+            AVG(NULLIF(lt.likes, 0))::REAL AS avg_likes,
+            AVG(EXTRACT(EPOCH FROM (NOW() - l.first_seen)) / 86400)::REAL AS avg_days_on_market
+          FROM listings l
+          JOIN latest lt ON lt.listing_id = l.listing_id
+         WHERE {where_sql}
+         GROUP BY l.platform
+         ORDER BY count DESC
+    """
+
+    cheapest_sql = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek, likes
+              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
+        ), ranked AS (
+            SELECT
+                l.platform, l.listing_id, l.title, l.url, l.image_url,
+                l.condition, l.size,
+                lt.price_sek, lt.likes,
+                ROW_NUMBER() OVER (PARTITION BY l.platform ORDER BY lt.price_sek ASC) AS rn
+              FROM listings l
+              JOIN latest lt ON lt.listing_id = l.listing_id
+             WHERE {where_sql}
+        )
+        SELECT platform, listing_id, title, url, image_url, condition, size, price_sek, likes
+          FROM ranked
+         WHERE rn <= 3
+         ORDER BY platform, rn
+    """
+
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute(aggregates_sql, base_params)
+                aggregate_rows = [dict(r) for r in cur.fetchall()]
+                cur.execute(cheapest_sql, base_params)
+                cheap_rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        logger.exception("GET /platforms/compare query failed")
+        raise HTTPException(500, "Database query failed — check server logs")
+
+    cheapest_by_platform: dict[str, list[dict[str, Any]]] = {}
+    for row in cheap_rows:
+        cheapest_by_platform.setdefault(row["platform"], []).append(
+            {
+                "id": row["listing_id"],
+                "title": row["title"],
+                "url": row["url"] or PLATFORM_BASE_URLS.get(row["platform"], ""),
+                "image_url": row["image_url"],
+                "condition": row["condition"],
+                "size": row["size"],
+                "price_sek": row["price_sek"],
+                "likes": row["likes"],
+            }
+        )
+
+    platforms: list[dict[str, Any]] = []
+    for row in aggregate_rows:
+        avg_likes = row["avg_likes"]
+        avg_dom = row["avg_days_on_market"]
+        platforms.append(
+            {
+                "platform": row["platform"],
+                "count": int(row["count"]),
+                "avg_price": int(row["avg_price"]) if row["avg_price"] is not None else None,
+                "median_price": int(row["median_price"]) if row["median_price"] is not None else None,
+                "p25": int(row["p25"]) if row["p25"] is not None else None,
+                "p75": int(row["p75"]) if row["p75"] is not None else None,
+                "min_price": int(row["min_price"]) if row["min_price"] is not None else None,
+                "max_price": int(row["max_price"]) if row["max_price"] is not None else None,
+                "avg_likes": round(float(avg_likes), 1) if avg_likes is not None else None,
+                "avg_days_on_market": round(float(avg_dom), 1) if avg_dom is not None else None,
+                "sample_confidence": confidence_tier(int(row["count"])),
+                "cheapest_3": cheapest_by_platform.get(row["platform"], []),
+            }
+        )
+
+    return {
+        "query": q,
+        "filters": {"condition": condition, "size": size, "brand": brand, "days": days},
+        "total_listings": sum(p["count"] for p in platforms),
+        "platforms": platforms,
+        "arbitrage_signal": compute_arbitrage_signal(platforms),
+    }
+
+
+@app.get("/platforms/compare/history")
+def get_platforms_compare_history(q: str, days: int = 30) -> dict[str, Any]:
+    """Per-platform daily median prices over the last *days* days."""
+    keywords = [kw for kw in q.split() if kw]
+    if not keywords:
+        raise HTTPException(400, "q parameter required and must not be empty")
+    if days <= 0 or days > 365:
+        raise HTTPException(400, "days must be in 1..365")
+
     joiner = " AND " if len(keywords) >= 3 else " OR "
     keyword_clauses = joiner.join(
         "(l.title ILIKE %s OR COALESCE(l.brand, '') ILIKE %s)" for _ in keywords
@@ -394,39 +542,46 @@ def get_platforms_compare(q: str) -> dict[str, Any]:
         params.extend([pat, pat])
 
     sql = f"""
-        WITH latest AS (
-            SELECT DISTINCT ON (listing_id) listing_id, price_sek
-              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
-        )
         SELECT
             l.platform,
-            COUNT(*) AS count,
-            ROUND(AVG(lt.price_sek))::INTEGER AS avg_price,
-            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS median_price,
-            MIN(lt.price_sek) AS min_price,
-            MAX(lt.price_sek) AS max_price
+            DATE_TRUNC('day', s.scraped_at)::DATE AS day,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY s.price_sek))::INTEGER AS median_price,
+            COUNT(*) AS sample_size
           FROM listings l
-          JOIN latest lt ON lt.listing_id = l.listing_id
-         WHERE l.status = 'active'
-           AND lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}
+          JOIN listing_snapshots s ON s.listing_id = l.listing_id
+         WHERE s.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}
+           AND s.scraped_at >= NOW() - INTERVAL '{int(days)} days'
            AND ({keyword_clauses})
-         GROUP BY l.platform
-        HAVING COUNT(*) >= 3
-         ORDER BY count DESC
+         GROUP BY l.platform, day
+         ORDER BY l.platform, day
     """
+
     try:
         with pg_read() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 rows = [dict(r) for r in cur.fetchall()]
     except Exception:
-        logger.exception("GET /platforms/compare query failed")
+        logger.exception("GET /platforms/compare/history query failed")
         raise HTTPException(500, "Database query failed — check server logs")
+
+    by_platform: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_platform.setdefault(row["platform"], []).append(
+            {
+                "day": row["day"].isoformat() if row["day"] else None,
+                "median_price": int(row["median_price"]),
+                "sample_size": int(row["sample_size"]),
+            }
+        )
 
     return {
         "query": q,
-        "total_listings": sum(r["count"] for r in rows),
-        "platforms": rows,
+        "days": days,
+        "platforms": [
+            {"platform": platform, "points": points}
+            for platform, points in by_platform.items()
+        ],
     }
 
 

@@ -1,7 +1,7 @@
 """Shared listing model used by all platform scrapers."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -23,6 +23,8 @@ class Listing(BaseModel):
     views: Optional[int] = None
     position_in_search: int
     scraped_at: datetime
+    image_url: Optional[str] = None
+    raw_extras: Optional[dict[str, Any]] = None  # platform-specific fields; stored as JSON in listings.raw
 
     @field_validator("brand", mode="before")
     @classmethod

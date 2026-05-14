@@ -8,15 +8,19 @@ Built solo by Samuel (18 y/o, learning to build real systems). Claude Code and C
 
 ---
 
-## Current state (as of 2026-05-07)
+## Current state (as of 2026-05-12)
 
-Phase 2 is complete and partially into Phase 3 analytics:
-- **Plick** and **Vinted** are both scraped and ingested
+Phase 2.5 complete, Phase 3 alerts shipped, Phase 4 web UI underway:
+- **Plick**, **Vinted**, **Tradera**, and **Blocket** all scraped, ingested, and fully wired into both new-listing and update flows
 - **Postgres** (Supabase) is live and the primary data store for the API
-- **FastAPI backend** is deployed on Railway
+- **FastAPI backend** deployed on Railway at `https://bourse-production.up.railway.app`
 - **SQLite** is still used by the local CLI (`bourse` command)
-- **Tradera scraper** is next (Codex is being assigned this)
-- No automated cron job yet — scraping is triggered manually via API endpoints
+- **Telegram alerts** working — `check_alerts()` fires after every `POST /scrape/new` run
+- **Watchlist** is now Postgres-backed on Railway; `watchlist.txt` kept as a fallback
+- **Cron entry point** at `src/bourse/cron.py` (`python -m bourse.cron` with `CRON_JOB=scrape-new|scrape-update`); Railway cron services still need to be configured in the dashboard
+- **Cross-platform comparison** endpoint `/platforms/compare?q=…` — returns p25/median/p75/spread per platform, top-3 cheapest listings per platform, sample confidence tiers, and a top-level `arbitrage_signal` recommending the best buy→sell platform pair net of fees + shipping
+- **Price history** endpoint `/platforms/compare/history?q=…&days=30` — feeds spark lines on the frontend
+- **React frontend** lives in `~/projects/garms-glance` (TanStack Start + Tailwind v4 + shadcn). Heavily redesigned: light editorial theme (cream + terracotta), custom hoodie spinner on `/landing` (canvas-based 24fps frame sequence), and a 4-platform `/compare` page consuming the new endpoint. See `SESSION_NOTES.md` for handoff details.
 
 ---
 
@@ -25,10 +29,15 @@ Phase 2 is complete and partially into Phase 3 analytics:
 | File | Purpose |
 |------|---------|
 | `src/bourse/api.py` | FastAPI app — all HTTP endpoints, startup logic |
-| `src/bourse/alerts.py` | **[IN PROGRESS — Codex owned]** Price-drop and like-velocity alerts |
+| `src/bourse/alert_routes.py` | `APIRouter` for `GET/POST/DELETE /alerts` endpoints |
+| `src/bourse/alerts.py` | Price alert matching and Telegram delivery; rate-limit handling |
 | `src/bourse/backfill.py` | `backfill_brands()` / `backfill_sizes()` — normalize existing Postgres data |
+| `src/bourse/blocket.py` | Blocket.se scraper (embedded `__NEXT_DATA__` JSON via httpx; curl-cffi Cloudflare fallback) |
 | `src/bourse/cli.py` | Typer CLI — all `bourse` terminal commands |
+| `src/bourse/compare.py` | Pure-Python helpers for `/platforms/compare` (confidence tiers, arbitrage signal) |
+| `src/bourse/cron.py` | Cron entry point — runs `run_scrape_new` or `run_scrape_update` based on `CRON_JOB` env var |
 | `src/bourse/db.py` | SQLite schema DDL and connection helper |
+| `src/bourse/fees.py` | `PLATFORM_FEES` + `SHIPPING_COST_SEK` constants used by the arbitrage signal |
 | `src/bourse/ingest.py` | Filter, normalize, and write listings to SQLite; defines `PRICE_MIN`/`PRICE_MAX` |
 | `src/bourse/migrate.py` | One-time script to copy SQLite → Postgres |
 | `src/bourse/models.py` | Shared `Listing` pydantic model used by all scrapers |
@@ -36,10 +45,13 @@ Phase 2 is complete and partially into Phase 3 analytics:
 | `src/bourse/pg_report.py` | Postgres-backed report queries consumed by `GET /report` |
 | `src/bourse/plick.py` | Plick.se scraper (HTML via httpx + selectolax) |
 | `src/bourse/report.py` | SQLite-backed analytics + Rich terminal tables for the CLI |
-| `src/bourse/scrape_tasks.py` | Background scrape tasks for the API; pg read/write helpers; watchlist run tracking |
+| `src/bourse/scrape_tasks.py` | Background scrape tasks; pg helpers; watchlist run tracking; Postgres backoff |
+| `src/bourse/seed_watchlist.py` | Seeds the Postgres watchlist with the curated 30-query arbitrage set |
 | `src/bourse/tradera.py` | Tradera.se scraper (embedded JSON in search-page HTML, via httpx + selectolax) |
 | `src/bourse/vinted.py` | Vinted.se scraper (JSON API via curl-cffi with Chrome TLS fingerprint) |
-| `tests/test_alerts.py` | **[IN PROGRESS — Codex owned]** Tests for alerts.py |
+| `tests/test_alerts.py` | Tests for alerts.py (Codex owned) |
+| `tests/test_blocket.py` | Blocket scraper unit tests (mocked `__NEXT_DATA__` fixtures) |
+| `tests/test_compare.py` | Confidence tier + arbitrage signal unit tests |
 | `tests/test_normalize.py` | 16 brand + 18 size normalization tests |
 
 ---
@@ -47,9 +59,9 @@ Phase 2 is complete and partially into Phase 3 analytics:
 ## Tech stack
 
 - **Python 3.11+** for everything
-- **httpx** — Plick HTTP requests
-- **curl-cffi** — Vinted requests (Chrome TLS fingerprint to pass Cloudflare)
-- **selectolax** — HTML parsing for Plick
+- **httpx** — Plick, Tradera, and Blocket HTTP requests
+- **curl-cffi** — Vinted requests (Chrome TLS fingerprint to pass Cloudflare); also the Blocket fallback when Cloudflare returns 403
+- **selectolax** — HTML parsing for Plick, Tradera, and Blocket
 - **pydantic v2** — `Listing` model validation
 - **typer** — CLI
 - **polars** — analytics in the CLI report
@@ -67,12 +79,14 @@ Phase 2 is complete and partially into Phase 3 analytics:
 Create `.env` at the project root (never commit it):
 
 ```
-DATABASE_URL=postgres://...  # Supabase Session Pooler connection string
+DATABASE_URL=postgres://...       # Supabase Session Pooler connection string
+TELEGRAM_BOT_TOKEN=...            # Telegram bot token (from BotFather)
+TELEGRAM_CHAT_ID=...              # Your personal chat ID or group ID
 ```
 
-`DATABASE_URL` is required for the API to start. The CLI uses SQLite and doesn't need it.
+`DATABASE_URL` is required for the API to start. `TELEGRAM_*` vars are optional — alerts are silently skipped if missing. The CLI uses SQLite and doesn't need any of these.
 
-On Railway, `DATABASE_URL` is set as an environment variable — `load_dotenv()` is a no-op there.
+On Railway, all env vars are set in the Railway dashboard — `load_dotenv()` is a no-op there.
 
 ---
 
@@ -83,7 +97,7 @@ On Railway, `DATABASE_URL` is set as an environment variable — `load_dotenv()`
 ```sql
 CREATE TABLE listings (
     listing_id    TEXT PRIMARY KEY,       -- "{platform}:{platform_id}"
-    platform      TEXT NOT NULL,          -- plick | vinted | blocket | tradera
+    platform      TEXT NOT NULL,          -- plick | vinted | tradera
     url           TEXT NOT NULL,
     title         TEXT NOT NULL,
     brand         TEXT,                   -- normalized via normalize_brand()
@@ -92,11 +106,12 @@ CREATE TABLE listings (
     material      TEXT,
     seller_name   TEXT NOT NULL,
     seller_rating REAL,
-    posted_at     TIMESTAMP,              -- Vinted exposes this; Plick/Plick don't
+    posted_at     TIMESTAMP,              -- Vinted exposes this; Plick/Tradera don't
     first_seen    TIMESTAMP NOT NULL,
     last_seen     TIMESTAMP NOT NULL,
     status        TEXT NOT NULL DEFAULT 'active',  -- active | sold | removed | unknown
-    raw           TEXT                    -- JSON blob for extra platform fields
+    raw           TEXT,                   -- JSON blob for extra platform fields (e.g. Blocket location/category)
+    image_url     TEXT                    -- thumbnail URL when scraper exposes one (Blocket today; others null until they populate)
 );
 
 CREATE TABLE listing_snapshots (
@@ -109,6 +124,16 @@ CREATE TABLE listing_snapshots (
     position_in_search INTEGER
 );
 -- Never UPDATE or DELETE snapshots. Only INSERT.
+
+CREATE TABLE price_alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    query       TEXT,
+    category    TEXT,
+    size        TEXT,
+    max_price   INTEGER NOT NULL,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ### Postgres (Supabase — API production)
@@ -116,6 +141,8 @@ CREATE TABLE listing_snapshots (
 Same schema as SQLite with these differences:
 - `listing_snapshots.id` is `SERIAL PRIMARY KEY` (not `AUTOINCREMENT`)
 - All timestamps stored as native `TIMESTAMP` (not ISO strings)
+- `price_alerts` table lives in SQLite only for now (see known issues)
+- `image_url` is added via `ensure_listing_columns()` idempotent migration at API startup
 
 Additional tables created automatically at API startup:
 ```sql
@@ -165,7 +192,7 @@ Both functions accept `str | None` and always return `str`.
 
 On first Railway deploy, the `watchlist` table is seeded from `watchlist.txt` if it's empty. After that, `watchlist.txt` is only read as a fallback when Postgres is unreachable.
 
-The scraping tasks (`run_scrape_new`, `run_scrape_update`) call `pg_read_watchlist()`, which reads from Postgres and falls back to `watchlist.txt`.
+The scraping tasks (`run_scrape_new`, `run_scrape_update`) call `pg_read_watchlist()`, which reads from Postgres and falls back to `watchlist.txt`. If Postgres fails 3 consecutive times, `pg_read_watchlist()` enters a 10-minute backoff and reads from the file during that window (see Supabase circuit breaker section below).
 
 **CLI** still writes to `watchlist.txt` (local dev only):
 ```bash
@@ -177,6 +204,38 @@ bourse watchlist remove "acne studios hoodie"
 ```
 POST   /watchlist    {query: str}  → adds to Postgres
 DELETE /watchlist/{query}          → removes from Postgres
+```
+
+---
+
+## Telegram alerts
+
+`alerts.py` checks every new listing scraped by `run_scrape_new()` against active `price_alerts` rows. A match fires a Telegram message.
+
+**Rate limiting behaviour:**
+- Max 5 messages per scrape run — top matches sorted by likes, overflow sent as `"...and X more matches"`
+- 1-second sleep between each message
+- 429 from Telegram → retry once after 5 seconds before giving up
+
+**Matching logic:**
+- `max_price` — listing price must be strictly below the alert threshold
+- `category` — optional; matched via keyword detection on the title
+- `size` — optional; exact string match on normalized size
+- A listing only fires one message even if it matches multiple alerts
+
+**CLI commands:**
+```bash
+bourse alerts test-telegram             # send a test message to verify credentials
+bourse alerts list                      # list all active alerts
+bourse alerts add "acne hoodie" --max-price 800 --category hoodie --size M
+bourse alerts remove <id>               # deactivate by ID
+```
+
+**API endpoints** (`/alerts` prefix, via `alert_routes.py`):
+```
+GET    /alerts               → [{id, query, category, size, max_price, active}]
+POST   /alerts               body: {query, max_price_sek, category?, size?} → 201
+DELETE /alerts/{id}          → 200 or 404
 ```
 
 ---
@@ -195,7 +254,13 @@ bourse scrape plick --watchlist --pages 10  # more pages per query
 bourse scrape vinted "acne studios"         # same for Vinted
 bourse scrape vinted --watchlist
 
-bourse scrape all --watchlist               # both platforms, all queries
+bourse scrape tradera "acne studios"        # same for Tradera
+bourse scrape tradera --watchlist
+
+bourse scrape blocket "iphone 14 pro"       # same for Blocket
+bourse scrape blocket --watchlist
+
+bourse scrape all --watchlist               # all four platforms, all queries
 bourse scrape all --watchlist --pages 10
 ```
 
@@ -224,12 +289,21 @@ bourse db backfill-sizes    # normalize size field for all listings in Postgres
 
 Both `db clean` and `db clean-prices` show a preview and require confirmation before deleting.
 
+### Alerts
+
+```bash
+bourse alerts test-telegram             # verify Telegram bot credentials
+bourse alerts list                      # show all active price alerts
+bourse alerts add "query" --max-price N [--category C] [--size S]
+bourse alerts remove <id>
+```
+
 ---
 
 ## API endpoints
 
 Base URL locally: `http://localhost:8000`  
-Base URL on Railway: set when deployed (check Railway dashboard).
+Base URL on Railway: `https://bourse-production.up.railway.app`
 
 ### Watchlist
 
@@ -249,7 +323,7 @@ DELETE /watchlist/{query}
 ### Scrape triggers (all return 202 Accepted, run in background)
 
 ```
-POST /scrape         → full scrape (both platforms, all queries, via subprocess)
+POST /scrape         → full scrape (all platforms, all queries, via subprocess)
 POST /scrape/new     → new listings only (stops per query when page is all known IDs)
 POST /scrape/update  → re-fetches all active listings to update price/likes/status
 ```
@@ -262,7 +336,7 @@ After `POST /scrape/update`, `watchlist_runs` is upserted for all queries with u
 ```
 GET /listings
 Query params (all optional):
-  platform=plick|vinted
+  platform=plick|vinted|tradera
   brand=acne+studios
   category=hoodie|longsleeve|t-shirt|jeans|jacket|other
   min_price=500
@@ -283,6 +357,76 @@ GET /listings/{listing_id}/history
 → [{id, listing_id, scraped_at, price_sek, likes, views, position_in_search}]
 Status 404 if not found.
 ```
+
+### Alerts
+
+```
+GET    /alerts               → [{id, query, category, size, max_price, active}]
+POST   /alerts               {query, max_price_sek, category?, size?} → 201
+DELETE /alerts/{id}          → 200 or 404
+```
+
+### Platforms (cross-platform comparison)
+
+```
+GET /platforms/compare?q=...
+       &condition=...   (optional)
+       &size=...        (optional)
+       &brand=...       (optional)
+       &days=90         (default 90, in 1..365)
+→ {
+    query: str,
+    filters: {condition, size, brand, days},
+    total_listings: int,
+    platforms: [
+      {
+        platform,                  -- "plick" | "vinted" | "tradera" | "blocket"
+        count,
+        avg_price, median_price,
+        p25, p75,                  -- quartiles for the spread bar
+        min_price, max_price,
+        avg_likes,                 -- null when no platform exposes likes (e.g. Blocket)
+        avg_days_on_market,
+        sample_confidence,         -- "low" <5, "medium" 5–15, "high" >15
+        cheapest_3: [
+          {id, title, url, image_url, condition, size, price_sek, likes}
+        ]
+      }
+    ],
+    arbitrage_signal: {            -- null when fewer than 2 platforms have sample ≥5
+      buy_platform, sell_platform,
+      buy_price_sek, sell_median_sek,
+      est_margin_sek,              -- revenue (sell median × (1 − sell_fee)) − cost (cheapest_buy + shipping)
+      est_margin_pct,
+      gross_margin_sek             -- sell_median − cheapest_buy, before fees + shipping
+    } | null
+  }
+```
+
+Same keyword logic as `/listings/by-query`: AND match for ≥3 words, OR for 1–2.
+Filters to active listings + sane prices + first_seen within `days`. Returns one
+entry per platform with at least one match; the frontend can hide low-confidence
+cells. Arbitrage signal evaluates all ordered pairs (up to 12 across 4 platforms)
+and picks the highest net margin. Fees + shipping come from `src/bourse/fees.py`:
+
+```python
+PLATFORM_FEES = {"plick": 0.0, "vinted": 0.05, "tradera": 0.10, "blocket": 0.0}
+SHIPPING_COST_SEK = 79
+```
+
+```
+GET /platforms/compare/history?q=...&days=30
+→ {
+    query: str,
+    days: int,
+    platforms: [
+      {platform, points: [{day: "YYYY-MM-DD", median_price, sample_size}]}
+    ]
+  }
+```
+
+Daily median prices grouped by date + platform from `listing_snapshots`. Powers
+the 30-day spark line on each platform column in the redesigned `/compare` page.
 
 ### Report
 
@@ -309,10 +453,13 @@ All report data uses only active listings with sane prices (200–50,000 SEK).
 3. For each query:
    - **Plick**: fetch HTML search pages via httpx, parse with selectolax, extract cards → fetch detail page for each new card (condition, material, likes, seller_rating, price from JSON-LD)
    - **Vinted**: fetch JSON from `/api/v2/catalog/items` via curl-cffi (Chrome TLS impersonation), parse items directly
+   - **Tradera**: fetch HTML search pages via httpx, parse embedded `__NEXT_DATA__` JSON
+   - **Blocket**: fetch HTML search pages via httpx → embedded `__NEXT_DATA__` JSON; auto-falls-back to curl-cffi if Cloudflare returns 403. Categories are filtered in the parser (electronics, fashion, sport, watches, photo); vehicles/real estate/jobs are dropped. "Skicka bud" / 0-SEK / auction listings are dropped. `likes` left null.
    - Stop scraping pages as soon as an entire page contains only known IDs
 4. Filter results: keyword match + price sanity (200–50,000 SEK) + normalize brand/size
 5. Upsert to `listings` + insert to `listing_snapshots` in Postgres
 6. Upsert `watchlist_runs` for the query with timestamp + count
+7. Call `check_alerts(all_new)` — fires Telegram messages for any matches (matches across all platforms including Blocket)
 
 ### Update flow (`POST /scrape/update`)
 
@@ -329,16 +476,35 @@ All report data uses only active listings with sane prices (200–50,000 SEK).
 
 - Plick: HTML cached to `.cache/{sha256[:20]}.html` for 24h
 - Vinted: JSON cached to `.cache/{sha256[:20]}.json` for 24h
-- `fetch_listing()` in both scrapers bypasses cache (always fetches live for updates)
+- Tradera: HTML cached to `.cache/tradera-{sha256[:20]}.html` for 24h
+- Blocket: HTML cached to `.cache/blocket-{sha256[:20]}.html` for 24h
+- `fetch_listing()` in all scrapers bypasses cache (always fetches live for updates)
 
 ### Rate limiting
 
-| Platform | Delay | Backoff |
-|----------|-------|---------|
-| Plick | 2–4s random between requests | 2s → 4s → 8s → abort |
-| Vinted | 1–2s random between requests | 2s → 4s → 8s → abort |
+| Platform | Delay | Backoff | Parser |
+|----------|-------|---------|--------|
+| Plick | 2–4s random between requests | 2s → 4s → 8s → abort | HTML via selectolax |
+| Vinted | 1–2s random between requests | 2s → 4s → 8s → abort | JSON via curl-cffi |
+| Tradera | 2–4s random between requests | 2s → 4s → 8s → abort | `__NEXT_DATA__` via httpx |
+| Blocket | 2–4s random between requests | 2s → 4s → 8s → abort | `__NEXT_DATA__` via httpx, curl-cffi fallback on 403 |
 
 Never parallel. Always single-threaded.
+
+---
+
+## Supabase circuit breaker and Postgres backoff
+
+Supabase's connection pooler (pgBouncer) has a circuit breaker that trips when it receives too many failing connection attempts in a short window. This was triggered by Railway health checks calling `GET /watchlist` every minute while the DB was briefly unreachable, causing a flood of `pg_read_watchlist()` retries that kept the circuit open.
+
+**Fix in `scrape_tasks.py`:** `pg_read_watchlist()` tracks consecutive failures with module-level state:
+
+- `_pg_failure_count` — increments on each failure, resets to 0 on success
+- `_pg_backoff_until` — set to `now + 10 minutes` when `_pg_failure_count` reaches 3; cleared on success
+
+While `now < _pg_backoff_until`, all calls return immediately from `watchlist.txt` without touching Postgres. After the backoff window expires the next call probes Postgres again; one success fully resets the state.
+
+**If Supabase's circuit breaker is already tripped on a fresh Railway deploy:** wait 5–10 minutes before triggering any scrape. The health check endpoint (`GET /watchlist`) will keep returning file-backed data during the backoff window, so Railway won't mark the service as down. Once the circuit resets, the first successful `pg_read_watchlist()` call clears the backoff automatically.
 
 ---
 
@@ -346,9 +512,10 @@ Never parallel. Always single-threaded.
 
 ### Railway (production)
 
+- **URL**: `https://bourse-production.up.railway.app`
 - **Service**: FastAPI app via uvicorn
 - **Start command**: `uvicorn bourse.api:app --host 0.0.0.0 --port $PORT`
-- **Builder**: NIXPACKS (auto-detects Python, installs from `requirements.txt`)
+- **Builder**: NIXPACKS — installs from `requirements.txt`, which includes `.` at the top to install the local `bourse` package
 - **Health check**: `GET /watchlist` with 30s timeout
 - **Restart policy**: ON_FAILURE
 - **Config**: `railway.toml` + `Procfile` at project root
@@ -357,12 +524,13 @@ Never parallel. Always single-threaded.
 
 - The FastAPI API (`api.py`)
 - All scraping endpoints (`/scrape`, `/scrape/new`, `/scrape/update`)
+- All alert endpoints (`/alerts`)
 - Postgres connection via `DATABASE_URL` env var
 
 ### What's still local only
 
 - The `bourse` CLI (SQLite-backed)
-- `bourse.db` (SQLite database)
+- `bourse.db` (SQLite database, including `price_alerts` table)
 - `migrate.py` (run once to move data from SQLite → Postgres)
 - `.cache/` directory (scraper HTTP cache)
 
@@ -410,11 +578,12 @@ pytest tests/
 
 ## Known issues / in progress
 
-- No automated cron job on Railway yet — scraping must be triggered manually via API
-- `bourse db clean` and `bourse db clean-prices` only work on SQLite (local); no Postgres equivalent yet
-- `migrate.py` is a one-time script with no idempotency for updates — if run twice it silently skips duplicates but doesn't update changed fields
-- Plick search results ordering is "relevance" which changes — position_in_search is approximate
-- Vinted `posted_at` comes from photo timestamp (a proxy, not the true listing date)
+- **`price_alerts` table is SQLite-only** — `alerts.py` reads from `bourse.db`, which is not persisted across Railway deploys. Alerts added via CLI survive locally; alerts added via the API (`/alerts`) are lost on redeploy. Fix: migrate `price_alerts` to Postgres.
+- **Supabase circuit breaker** — if the DB was unreachable during a recent deploy, it may take 5–10 minutes for Supabase's circuit breaker to reset. During that window `pg_read_watchlist()` serves from `watchlist.txt`. Do not trigger scrapes until `GET /watchlist` returns Postgres-backed data (check `last_scraped_at` is non-null).
+- **`bourse db clean` and `bourse db clean-prices`** — only work on SQLite (local); no Postgres equivalent yet
+- **`migrate.py`** — one-time script with no idempotency for updates; running twice silently skips duplicates but doesn't update changed fields
+- **Plick search results ordering** — "relevance" ordering shifts over time; `position_in_search` is approximate
+- **Vinted `posted_at`** — comes from photo upload timestamp (a proxy, not the true listing date)
 
 ---
 
@@ -424,15 +593,34 @@ pytest tests/
 |-------|--------|-------------|
 | 1 | ✅ Done | Plick scraper, SQLite, CLI |
 | 2 | ✅ Done | Vinted scraper, Postgres, FastAPI, Railway deploy, normalization |
-| 2.5 | ✅ Done | Tradera scraper, wired into API and CLI |
-| 3 | 🔄 In progress | Alerts (`alerts.py` — Codex owned); hedonic pricing model next |
+| 2.5 | ✅ Done | Tradera scraper, fully wired into API and CLI (new + update flows) |
+| 3 | ✅ Done | Telegram alerts, price alert CRUD, rate limiting, Postgres watchlist, backoff |
 | 4 | Planned | Web UI (Lovable), scheduled scraping (cron on Railway), multi-user |
 
 ### Immediate next tasks
 
-1. **Railway cron** — set up Railway's cron to call `POST /scrape/new` daily and `POST /scrape/update` every few hours
-2. **Postgres `clean-prices` command** — equivalent of `bourse db clean-prices` but targets the live Postgres DB
-3. **`price_alerts` to Postgres** — currently `alerts.py` uses SQLite (`bourse.db`). On Railway, `bourse.db` is not persisted across deploys. Move price alerts to the Postgres DB so they survive redeployment.
+1. **Configure Railway cron services** — entry point `src/bourse/cron.py` is ready. Create two cron services in the Railway dashboard pointing at this repo, both running `python -m bourse.cron`: one with `CRON_JOB=scrape-new` daily, one with `CRON_JOB=scrape-update` every few hours. Both need `DATABASE_URL` (and `TELEGRAM_*` for alerts).
+2. **`price_alerts` to Postgres** — `alerts.py` uses SQLite; alerts are lost on redeploy. Migrate the table and update `alerts.py` and `alert_routes.py` to use `pg_read()`/`pg_write()`.
+3. **Postgres `clean-prices` command** — equivalent of `bourse db clean-prices` but targets the live Postgres DB
+
+### Seeding the watchlist
+
+`src/bourse/seed_watchlist.py` POSTs the 30 curated arbitrage queries to the
+running API. Idempotent — queries already in `watchlist` are skipped:
+
+```bash
+# Local API on http://localhost:8000
+python3 -m bourse.seed_watchlist
+
+# Production
+BOURSE_API_URL=https://bourse-production.up.railway.app python3 -m bourse.seed_watchlist
+```
+
+### Fees and shipping config
+
+`src/bourse/fees.py` defines `PLATFORM_FEES` (Plick 0%, Vinted 5%, Tradera 10%,
+Blocket 0%) and `SHIPPING_COST_SEK` (flat 79 kr). Edit this file to retune
+the net arbitrage signal — values are read at request time, no restart needed.
 
 ---
 

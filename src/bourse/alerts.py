@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -88,6 +89,9 @@ def _format_alert_message(listing: Listing) -> str:
     )
 
 
+_MAX_ALERTS_PER_RUN = 5
+
+
 def send_telegram(message: str) -> None:
     """Send a Telegram message if bot credentials are configured."""
     load_dotenv()
@@ -98,12 +102,25 @@ def send_telegram(message: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    response = httpx.post(
-        url,
-        json={"chat_id": chat_id, "text": message},
-        timeout=15,
-    )
-    response.raise_for_status()
+    try:
+        response = httpx.post(
+            url,
+            json={"chat_id": chat_id, "text": message},
+            timeout=15,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            logger.warning("Telegram 429 rate limit — retrying after 5s")
+            time.sleep(5)
+            retry = httpx.post(
+                url,
+                json={"chat_id": chat_id, "text": message},
+                timeout=15,
+            )
+            retry.raise_for_status()
+        else:
+            raise
 
 
 def check_alerts(new_listings: list[Listing]) -> None:
@@ -117,7 +134,29 @@ def check_alerts(new_listings: list[Listing]) -> None:
     if not alerts:
         return
 
+    matched: list[Listing] = []
+    seen_ids: set[str] = set()
     for listing in new_listings:
+        if listing.listing_id in seen_ids:
+            continue
         for alert in alerts:
             if _matches_alert(listing, alert):
-                send_telegram(_format_alert_message(listing))
+                matched.append(listing)
+                seen_ids.add(listing.listing_id)
+                break
+
+    if not matched:
+        return
+
+    matched.sort(key=lambda l: l.likes or 0, reverse=True)
+    overflow = len(matched) - _MAX_ALERTS_PER_RUN
+    to_send = matched[:_MAX_ALERTS_PER_RUN]
+
+    for i, listing in enumerate(to_send):
+        send_telegram(_format_alert_message(listing))
+        if i < len(to_send) - 1:
+            time.sleep(1)
+
+    if overflow > 0:
+        time.sleep(1)
+        send_telegram(f"...and {overflow} more matches")

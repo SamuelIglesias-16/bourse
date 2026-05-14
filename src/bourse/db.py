@@ -33,7 +33,8 @@ def init_db(path: Path = DB_PATH) -> None:
                 first_seen      TIMESTAMP NOT NULL,
                 last_seen       TIMESTAMP NOT NULL,
                 status          TEXT NOT NULL DEFAULT 'active',  -- active | sold | removed | unknown
-                raw             TEXT                        -- JSON blob for extra platform fields
+                raw             TEXT,                       -- JSON blob for extra platform fields (location, category…)
+                image_url       TEXT                        -- thumbnail URL when scraper exposes one (Blocket+, others null)
             );
 
             CREATE TABLE IF NOT EXISTS listing_snapshots (
@@ -49,11 +50,15 @@ def init_db(path: Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_snapshots_listing_id
                 ON listing_snapshots (listing_id, scraped_at DESC);
         """)
-        # Migration: add posted_at to existing databases that predate this column
-        try:
-            conn.execute("ALTER TABLE listings ADD COLUMN posted_at TIMESTAMP")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrations: add columns to existing databases that predate them
+        for ddl in (
+            "ALTER TABLE listings ADD COLUMN posted_at TIMESTAMP",
+            "ALTER TABLE listings ADD COLUMN image_url TEXT",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 if __name__ == "__main__":

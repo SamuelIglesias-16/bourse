@@ -106,14 +106,15 @@ def _upsert_listing(
         (listing.listing_id,),
     ).fetchone()
 
+    raw_blob = json.dumps(listing.raw_extras) if listing.raw_extras else json.dumps({})
     if row is None:
         conn.execute(
             """
             INSERT INTO listings (
                 listing_id, platform, url, title, brand, size, condition,
                 material, seller_name, seller_rating, posted_at,
-                first_seen, last_seen, status, raw
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                first_seen, last_seen, status, raw, image_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
             """,
             (
                 listing.listing_id,
@@ -129,7 +130,8 @@ def _upsert_listing(
                 listing.posted_at.isoformat() if listing.posted_at else None,
                 listing.scraped_at.isoformat(),
                 listing.scraped_at.isoformat(),
-                json.dumps({}),
+                raw_blob,
+                listing.image_url,
             ),
         )
         summary.new += 1
@@ -141,13 +143,15 @@ def _upsert_listing(
             UPDATE listings
                SET last_seen     = ?,
                    condition     = COALESCE(?, condition),
-                   seller_rating = COALESCE(?, seller_rating)
+                   seller_rating = COALESCE(?, seller_rating),
+                   image_url     = COALESCE(?, image_url)
              WHERE listing_id = ?
             """,
             (
                 listing.scraped_at.isoformat(),
                 listing.condition,
                 listing.seller_rating,
+                listing.image_url,
                 listing.listing_id,
             ),
         )
