@@ -107,14 +107,15 @@ def _upsert_listing(
     ).fetchone()
 
     raw_blob = json.dumps(listing.raw_extras) if listing.raw_extras else json.dumps({})
+    initial_status = listing.status_override or "active"
     if row is None:
         conn.execute(
             """
             INSERT INTO listings (
                 listing_id, platform, url, title, brand, size, condition,
                 material, seller_name, seller_rating, posted_at,
-                first_seen, last_seen, status, raw, image_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                first_seen, last_seen, status, raw, image_url, shipping_sek
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 listing.listing_id,
@@ -130,8 +131,10 @@ def _upsert_listing(
                 listing.posted_at.isoformat() if listing.posted_at else None,
                 listing.scraped_at.isoformat(),
                 listing.scraped_at.isoformat(),
+                initial_status,
                 raw_blob,
                 listing.image_url,
+                listing.shipping_sek,
             ),
         )
         summary.new += 1
@@ -144,7 +147,9 @@ def _upsert_listing(
                SET last_seen     = ?,
                    condition     = COALESCE(?, condition),
                    seller_rating = COALESCE(?, seller_rating),
-                   image_url     = COALESCE(?, image_url)
+                   image_url     = COALESCE(?, image_url),
+                   shipping_sek  = COALESCE(?, shipping_sek),
+                   status        = COALESCE(?, status)
              WHERE listing_id = ?
             """,
             (
@@ -152,6 +157,8 @@ def _upsert_listing(
                 listing.condition,
                 listing.seller_rating,
                 listing.image_url,
+                listing.shipping_sek,
+                listing.status_override,  # None preserves existing status
                 listing.listing_id,
             ),
         )

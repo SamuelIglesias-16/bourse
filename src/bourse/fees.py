@@ -19,9 +19,18 @@ PLATFORM_FEES: dict[str, float] = {
     "vinted": 0.05,
     "tradera": 0.10,
     "blocket": 0.0,
+    "ebay": 0.13,  # eBay final value fee + payment processing, rough average
 }
 
 SHIPPING_COST_SEK: int = 79
+
+# Currency: eBay.com items are priced in USD; converted once at ingest using
+# this rate. Bump it manually if the SEK/USD rate drifts materially.
+USD_TO_SEK: float = 10.5
+
+# International shipping eBay → Sweden, flat-rate default. Used by the
+# arbitrage signal when buy_platform or sell_platform is eBay.
+EBAY_SHIPPING_TO_SE_SEK: int = 250
 
 
 def fee_for(platform: str) -> float:

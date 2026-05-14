@@ -172,7 +172,7 @@ def _parse_search_page(html: str) -> list[dict]:
 
 
 def _parse_detail_page(html: str) -> dict:
-    """Extract condition, material, likes, seller_rating from a listing detail page."""
+    """Extract condition, material, likes, seller_rating, and sold-flag from a listing detail page."""
     tree = HTMLParser(html)
     result: dict = {}
 
@@ -185,6 +185,10 @@ def _parse_detail_page(html: str) -> dict:
                 result["seller_rating"] = float(ar.get("ratingValue", 0)) or None
             if (p := data.get("offers", {}).get("price")):
                 result["price_sek"] = int(float(str(p)))
+            # JSON-LD `offers.availability` flips to OutOfStock / SoldOut when listing is marked sold
+            avail = (data.get("offers", {}).get("availability") or "").lower()
+            if "soldout" in avail or "outofstock" in avail:
+                result["is_sold"] = True
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
@@ -206,6 +210,17 @@ def _parse_detail_page(html: str) -> dict:
     if likes_a:
         m = re.search(r"(\d+)", likes_a.text(strip=True))
         result["likes"] = int(m.group(1)) if m else 0
+
+    # Visual Såld badge on the listing page. Plick uses class fragments like
+    # "sold-badge", "label-sold", or a span with text "Såld".
+    if not result.get("is_sold"):
+        badge = (
+            tree.css_first(".sold-badge")
+            or tree.css_first(".label-sold")
+            or tree.css_first("[class*='sold']")
+        )
+        if badge and re.search(r"s[åa]ld", badge.text(strip=True), re.IGNORECASE):
+            result["is_sold"] = True
 
     return result
 
@@ -285,8 +300,16 @@ def scrape_query_new_only(query: str, known_ids: set[str], max_pages: int = 20) 
     return result
 
 
-def fetch_listing(url: str) -> tuple[int | None, int | None, bool]:
-    """Re-fetch a single Plick listing page. Returns (price_sek, likes, is_gone). Bypasses cache."""
+def fetch_listing(url: str) -> tuple[int | None, int | None, bool, bool]:
+    """Re-fetch a single Plick listing page.
+
+    Returns ``(price_sek, likes, is_gone, is_sold)`` — bypasses cache.
+
+    *is_sold* is True when the seller has flipped the listing to "Såld" but
+    the page is still up. *is_gone* is True when the page 404s (removed by
+    seller or moderation). Callers should treat sold + final price as more
+    valuable than gone — it's the actual sale data.
+    """
     with httpx.Client(follow_redirects=True) as client:
         client.headers["User-Agent"] = random.choice(USER_AGENTS)
         try:
@@ -294,8 +317,8 @@ def fetch_listing(url: str) -> tuple[int | None, int | None, bool]:
         except httpx.RequestError as exc:
             raise RuntimeError(str(exc)) from exc
         if resp.status_code == 404:
-            return None, None, True
+            return None, None, True, False
         resp.raise_for_status()
     _save_cache(url, resp.text); time.sleep(random.uniform(2, 4))
     d = _parse_detail_page(resp.text)
-    return d.get("price_sek"), d.get("likes"), False
+    return d.get("price_sek"), d.get("likes"), False, bool(d.get("is_sold"))

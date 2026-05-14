@@ -24,6 +24,8 @@ class Listing(BaseModel):
     position_in_search: int
     scraped_at: datetime
     image_url: Optional[str] = None
+    shipping_sek: Optional[int] = None  # eBay→SE shipping etc.; None for domestic-only platforms
+    status_override: Optional[str] = None  # ingest path honours this — "sold" for ended Tradera/eBay sales
     raw_extras: Optional[dict[str, Any]] = None  # platform-specific fields; stored as JSON in listings.raw
 
     @field_validator("brand", mode="before")

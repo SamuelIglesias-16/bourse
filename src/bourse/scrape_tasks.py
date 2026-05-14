@@ -32,6 +32,14 @@ except Exception:
     logging.getLogger(__name__).warning("blocket module unavailable — will be skipped")
 
 try:
+    import bourse.ebay as ebay
+    _ebay_available = True
+except Exception:
+    ebay = None  # type: ignore[assignment]
+    _ebay_available = False
+    logging.getLogger(__name__).warning("ebay module unavailable — will be skipped")
+
+try:
     from bourse.alerts import check_alerts as _check_alerts
 except Exception:
     _check_alerts = None  # type: ignore[assignment]
@@ -84,20 +92,26 @@ def pg_write() -> Generator[psycopg2.extensions.connection, None, None]:  # type
 def _upsert_listing(cur: Any, listing: Listing) -> None:
     import json as _json
     raw_blob = _json.dumps(listing.raw_extras) if listing.raw_extras else "{}"
+    initial_status = listing.status_override or "active"
     cur.execute(
         """INSERT INTO listings
                (listing_id, platform, url, title, brand, size, condition, material,
-                seller_name, seller_rating, posted_at, first_seen, last_seen, status, raw, image_url)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
+                seller_name, seller_rating, posted_at, first_seen, last_seen,
+                status, raw, image_url, shipping_sek)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            ON CONFLICT (listing_id) DO UPDATE
                SET last_seen     = EXCLUDED.last_seen,
                    condition     = COALESCE(EXCLUDED.condition, listings.condition),
                    seller_rating = COALESCE(EXCLUDED.seller_rating, listings.seller_rating),
-                   image_url     = COALESCE(EXCLUDED.image_url, listings.image_url)""",
+                   image_url     = COALESCE(EXCLUDED.image_url, listings.image_url),
+                   shipping_sek  = COALESCE(EXCLUDED.shipping_sek, listings.shipping_sek),
+                   status        = CASE WHEN %s IS NOT NULL THEN %s ELSE listings.status END""",
         (listing.listing_id, listing.platform, listing.url, listing.title,
          listing.brand, listing.size, listing.condition, listing.material,
          listing.seller_name, listing.seller_rating, listing.posted_at,
-         listing.scraped_at, listing.scraped_at, raw_blob, listing.image_url),
+         listing.scraped_at, listing.scraped_at, initial_status, raw_blob,
+         listing.image_url, listing.shipping_sek,
+         listing.status_override, listing.status_override),
     )
 
 
@@ -164,6 +178,7 @@ def ensure_listing_columns() -> None:
     with pg_write() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_url TEXT")
+            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_sek INTEGER")
 
 
 def ensure_opportunities_table() -> None:
@@ -190,10 +205,11 @@ def ensure_opportunities_table() -> None:
 
 
 def _platform_aggregates_for_query(cur: Any, query: str) -> list[dict[str, Any]]:
-    """Run the per-platform count + median query for one watchlist query.
+    """Per-platform aggregates (active + sold) for one watchlist query.
 
     Mirrors the keyword-match rule used by /platforms/compare (AND for ≥3
-    words, OR for 1–2). Returns a list of dicts with platform/count/median_price.
+    words, OR for 1–2). Returns a list of dicts with:
+      ``platform``, ``count``, ``median_price``, ``sold_count``, ``median_sold_price``.
     """
     from bourse.ingest import PRICE_MIN, PRICE_MAX  # local import to avoid cycle
 
@@ -217,11 +233,20 @@ def _platform_aggregates_for_query(cur: Any, query: str) -> list[dict[str, Any]]
         )
         SELECT
             l.platform,
-            COUNT(*) AS count,
-            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS median_price
+            COUNT(*) FILTER (WHERE l.status = 'active') AS count,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY CASE WHEN l.status = 'active' THEN lt.price_sek END
+            ))::INTEGER AS median_price,
+            COUNT(*) FILTER (
+                WHERE l.status = 'sold' AND l.last_seen >= NOW() - INTERVAL '90 days'
+            ) AS sold_count,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY CASE WHEN l.status = 'sold' AND l.last_seen >= NOW() - INTERVAL '90 days'
+                              THEN lt.price_sek END
+            ))::INTEGER AS median_sold_price
           FROM listings l
           JOIN latest lt ON lt.listing_id = l.listing_id
-         WHERE l.status = 'active'
+         WHERE l.status IN ('active', 'sold')
            AND lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}
            AND ({clauses})
          GROUP BY l.platform
@@ -266,8 +291,10 @@ def refresh_opportunities() -> dict[str, int]:
                     platforms = [
                         {
                             "platform": r["platform"],
-                            "count": int(r["count"]),
-                            "median_price": int(r["median_price"]) if r["median_price"] is not None else None,
+                            "count": int(r["count"] or 0),
+                            "median_price": int(r["median_price"]) if r.get("median_price") is not None else None,
+                            "sold_count": int(r["sold_count"] or 0),
+                            "median_sold_price": int(r["median_sold_price"]) if r.get("median_sold_price") is not None else None,
                         }
                         for r in rows
                     ]
@@ -278,7 +305,7 @@ def refresh_opportunities() -> dict[str, int]:
                             removed += 1
                         continue
 
-                    total_listings = sum(p["count"] for p in platforms)
+                    total_listings = sum(p["count"] + p["sold_count"] for p in platforms)
                     cur.execute(
                         """INSERT INTO arbitrage_opportunities
                                (query, buy_platform, sell_platform,
@@ -416,6 +443,51 @@ def _upsert_watchlist_run(query: str, now: datetime, listings_found: int | None)
 
 # ── Background tasks ─────────────────────────────────────────────────────────
 
+def run_scrape_sold() -> dict[str, int]:
+    """Sold-price scrape across Plick (Såld detection), Tradera (ended auctions), and eBay (LH_Sold).
+
+    Walks every watchlist query, ingests sold rows with ``status='sold'``, and
+    finally refreshes arbitrage_opportunities so sold medians flow through.
+
+    Plick sold-detection runs inside ``run_scrape_update`` (the badge surfaces
+    on the listing detail page); this task focuses on Tradera + eBay sold
+    histories, which are reachable only via dedicated search URLs.
+    """
+    try:
+        queries = pg_read_watchlist()
+        if not queries:
+            logger.info("scrape/sold: watchlist empty")
+            return {"sold_ingested": 0, "queries": 0}
+
+        sold_total = 0
+        for query in queries:
+            for scraper_label, fn in [
+                ("tradera-ended", tradera.scrape_query_ended if _tradera_available else None),
+                ("ebay-sold", ebay.scrape_query_ended if _ebay_available else None),
+            ]:
+                if fn is None:
+                    continue
+                try:
+                    sold_listings = fn(query)
+                except Exception:
+                    logger.exception("scrape/sold: %s failed for %r", scraper_label, query)
+                    continue
+                if sold_listings:
+                    _write_to_pg(sold_listings)
+                    sold_total += len(sold_listings)
+
+        try:
+            refresh_opportunities()
+        except Exception:
+            logger.exception("scrape/sold: refresh_opportunities failed (non-fatal)")
+
+        logger.info("scrape/sold complete: %d sold listings ingested across %d queries", sold_total, len(queries))
+        return {"sold_ingested": sold_total, "queries": len(queries)}
+    except Exception:
+        logger.exception("scrape/sold: unhandled error, task aborted")
+        return {"sold_ingested": 0, "queries": 0}
+
+
 def run_scrape_new() -> None:
     """Scrape each watchlist query, saving only listing IDs not already in Postgres."""
     try:
@@ -437,6 +509,8 @@ def run_scrape_new() -> None:
             _new_scrapers.append(tradera.scrape_query_new_only)
         if _blocket_available:
             _new_scrapers.append(blocket.scrape_query_new_only)
+        if _ebay_available:
+            _new_scrapers.append(ebay.scrape_query_new_only)
         for query in queries:
             query_count = 0
             for scraper in _new_scrapers:
@@ -484,6 +558,35 @@ def _mark_removed_pg(listing_id: str, now: datetime) -> None:
             )
 
 
+def _mark_sold_pg(listing_id: str, price_sek: int | None, now: datetime) -> None:
+    """Flip a listing to status='sold' and (when known) record the final-sale snapshot."""
+    try:
+        with pg_write() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE listings SET status = 'sold', last_seen = %s WHERE listing_id = %s",
+                    (now, listing_id),
+                )
+                if price_sek is not None:
+                    cur.execute(
+                        "INSERT INTO listing_snapshots (listing_id, scraped_at, price_sek, likes, views, position_in_search) VALUES (%s,%s,%s,NULL,NULL,NULL)",
+                        (listing_id, now, price_sek),
+                    )
+    except psycopg2.OperationalError as exc:
+        logger.warning("Postgres unreachable (%s) — SQLite fallback: marking %s sold", exc, listing_id)
+        from bourse.db import get_connection, DB_PATH
+        with get_connection(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE listings SET status = 'sold', last_seen = ? WHERE listing_id = ?",
+                (now.isoformat(), listing_id),
+            )
+            if price_sek is not None:
+                conn.execute(
+                    "INSERT INTO listing_snapshots (listing_id, scraped_at, price_sek, likes, views, position_in_search) VALUES (?,?,?,NULL,NULL,NULL)",
+                    (listing_id, now.isoformat(), price_sek),
+                )
+
+
 def _append_snapshot_pg(listing_id: str, price_sek: int, likes: int | None, now: datetime) -> None:
     try:
         with pg_write() as conn:
@@ -523,11 +626,12 @@ def run_scrape_update() -> None:
             return
 
         now = datetime.now()
-        updated = removed = 0
+        updated = removed = sold_count = 0
         for listing_id, url in active:
             try:
+                is_sold = False
                 if listing_id.startswith("plick:"):
-                    price, likes, is_gone = plick.fetch_listing(url)
+                    price, likes, is_gone, is_sold = plick.fetch_listing(url)
                 elif listing_id.startswith("vinted:"):
                     price, likes, is_gone = vinted.fetch_listing(listing_id)
                 elif listing_id.startswith("tradera:"):
@@ -542,10 +646,19 @@ def run_scrape_update() -> None:
                         continue
                     _p, _l = blocket.fetch_listing(listing_id, url)
                     price, likes, is_gone = _p, _l, (_p is None)
+                elif listing_id.startswith("ebay:"):
+                    if not _ebay_available:
+                        logger.debug("scrape/update: ebay unavailable, skipping %s", listing_id)
+                        continue
+                    _p, _l = ebay.fetch_listing(listing_id, url)
+                    price, likes, is_gone = _p, _l, (_p is None)
                 else:
                     logger.warning("scrape/update: unknown platform for %s", listing_id)
                     continue
-                if is_gone:
+                if is_sold:
+                    _mark_sold_pg(listing_id, price, now)
+                    sold_count += 1
+                elif is_gone:
                     _mark_removed_pg(listing_id, now)
                     removed += 1
                 elif price is not None:
@@ -555,7 +668,10 @@ def run_scrape_update() -> None:
                     logger.warning("scrape/update: no price found for %s, skipping", listing_id)
             except Exception:
                 logger.exception("scrape/update: failed for %s", listing_id)
-        logger.info("scrape/update complete: %d updated, %d removed", updated, removed)
+        logger.info(
+            "scrape/update complete: %d updated, %d sold, %d removed",
+            updated, sold_count, removed,
+        )
         for query in pg_read_watchlist():
             _upsert_watchlist_run(query, now, listings_found=None)
         try:

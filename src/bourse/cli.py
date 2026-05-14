@@ -9,8 +9,9 @@ import typer
 from bourse.db import DB_PATH, get_connection, init_db
 from bourse.ingest import ingest, PRICE_MIN, PRICE_MAX
 from bourse.blocket import scrape_query as scrape_blocket
+from bourse.ebay import scrape_query as scrape_ebay, scrape_query_ended as scrape_ebay_sold
 from bourse.plick import scrape_query as scrape_plick
-from bourse.tradera import scrape_query as scrape_tradera
+from bourse.tradera import scrape_query as scrape_tradera, scrape_query_ended as scrape_tradera_ended
 from bourse.vinted import scrape_query as scrape_vinted
 from bourse.report import print_report
 
@@ -213,7 +214,78 @@ def scrape_blocket_cmd(
         typer.echo(str(summary))
 
 
-# ── scrape all (both platforms) ────────────────────────────────────────────
+# ── scrape ebay ────────────────────────────────────────────────────────────
+
+
+@scrape_app.command("ebay")
+def scrape_ebay_cmd(
+    query: Optional[str] = typer.Argument(
+        None, help="Search query, e.g. 'iphone 14 pro'. Omit when using --watchlist."
+    ),
+    watchlist: bool = typer.Option(
+        False, "--watchlist", help="Read queries from watchlist.txt and scrape all."
+    ),
+    pages: int = typer.Option(3, "--pages", help="Search result pages to fetch per query."),
+) -> None:
+    """Scrape eBay (active listings) for one query or for every watchlist query."""
+    if watchlist and query:
+        typer.echo("Error: provide either a query argument or --watchlist, not both.", err=True)
+        raise typer.Exit(code=1)
+    if not watchlist and not query:
+        typer.echo("Error: provide a query argument or --watchlist.", err=True)
+        raise typer.Exit(code=1)
+
+    queries = _read_watchlist() if watchlist else [query]  # type: ignore[list-item]
+    if not queries:
+        typer.echo("Watchlist is empty. Add queries with: bourse watchlist add \"query\"")
+        raise typer.Exit()
+
+    init_db()
+    for q in queries:
+        typer.echo(f"\nScraping eBay for: {q!r}")
+        listings = scrape_ebay(q, pages=pages)
+        if not listings:
+            typer.echo("  No listings found.")
+            continue
+        summary = ingest(listings, query=q)
+        typer.echo(str(summary))
+
+
+# ── scrape sold (Plick Såld is caught by scrape/update; this covers Tradera + eBay) ─
+
+
+@scrape_app.command("sold")
+def scrape_sold_cmd(
+    watchlist: bool = typer.Option(
+        True, "--watchlist/--no-watchlist",
+        help="Read queries from watchlist.txt (default: on).",
+    ),
+    query: Optional[str] = typer.Argument(None, help="Single query (omit when using --watchlist)."),
+    pages: int = typer.Option(3, "--pages", help="Search pages to fetch per query per platform."),
+) -> None:
+    """Scrape SOLD prices across Tradera (ended auctions) and eBay (LH_Sold)."""
+    if not watchlist and not query:
+        typer.echo("Error: provide a query argument or --watchlist.", err=True)
+        raise typer.Exit(code=1)
+    queries = _read_watchlist() if watchlist else [query]  # type: ignore[list-item]
+    if not queries:
+        typer.echo("Watchlist is empty.")
+        raise typer.Exit()
+    init_db()
+    for q in queries:
+        typer.echo(f"\n── SOLD {q!r} ──")
+        for label, fn in (("Tradera (ended)", scrape_tradera_ended), ("eBay (sold)", scrape_ebay_sold)):
+            typer.echo(f"\n  Scraping {label}…")
+            sold = fn(q, pages=pages)
+            if not sold:
+                typer.echo("    No sold listings found.")
+                continue
+            summary = ingest(sold, query=q)
+            for line in str(summary).splitlines():
+                typer.echo(f"  {line}")
+
+
+# ── scrape all (all platforms) ─────────────────────────────────────────────
 
 
 @scrape_app.command("all")
@@ -224,7 +296,7 @@ def scrape_all(
     ),
     pages: int = typer.Option(5, "--pages", help="Search result pages to fetch per query per platform."),
 ) -> None:
-    """Scrape Plick, Vinted, Tradera and Blocket for every query in watchlist.txt."""
+    """Scrape Plick, Vinted, Tradera, Blocket and eBay for every query in watchlist.txt."""
     queries = _read_watchlist()
     if not queries:
         typer.echo(
@@ -242,6 +314,7 @@ def scrape_all(
             ("Vinted", scrape_vinted),
             ("Tradera", scrape_tradera),
             ("Blocket", scrape_blocket),
+            ("eBay", scrape_ebay),
         ]:
             typer.echo(f"\n  Scraping {platform_name}…")
             listings = scraper(q, pages=pages)

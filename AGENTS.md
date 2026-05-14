@@ -11,7 +11,8 @@ Built solo by Samuel (18 y/o, learning to build real systems). Claude Code and C
 ## Current state (as of 2026-05-12)
 
 Phase 2.5 complete, Phase 3 alerts shipped, Phase 4 web UI underway:
-- **Plick**, **Vinted**, **Tradera**, and **Blocket** all scraped, ingested, and fully wired into both new-listing and update flows
+- **Plick**, **Vinted**, **Tradera**, **Blocket**, and **eBay** (international USD reference) all scraped, ingested, and fully wired into both new-listing and update flows
+- **Sold-price tracking** across Plick (Såld badge), Tradera (ended auctions), and eBay (LH_Sold) — drives a "sold-aware" arbitrage signal that prefers actual sold medians over listed-price medians when ≥5 sales are recorded
 - **Postgres** (Supabase) is live and the primary data store for the API
 - **FastAPI backend** deployed on Railway at `https://bourse-production.up.railway.app`
 - **SQLite** is still used by the local CLI (`bourse` command)
@@ -33,6 +34,7 @@ Phase 2.5 complete, Phase 3 alerts shipped, Phase 4 web UI underway:
 | `src/bourse/alerts.py` | Price alert matching and Telegram delivery; rate-limit handling |
 | `src/bourse/backfill.py` | `backfill_brands()` / `backfill_sizes()` — normalize existing Postgres data |
 | `src/bourse/blocket.py` | Blocket.se scraper (embedded `__NEXT_DATA__` JSON via httpx; curl-cffi Cloudflare fallback) |
+| `src/bourse/ebay.py` | eBay.com scraper (international reference). Active + sold (`LH_Sold=1&LH_Complete=1`) flows; USD→SEK conversion at ingest; populates `shipping_sek` |
 | `src/bourse/cli.py` | Typer CLI — all `bourse` terminal commands |
 | `src/bourse/compare.py` | Pure-Python helpers for `/platforms/compare` (confidence tiers, arbitrage signal) |
 | `src/bourse/cron.py` | Cron entry point — runs `run_scrape_new` or `run_scrape_update` based on `CRON_JOB` env var |
@@ -51,7 +53,8 @@ Phase 2.5 complete, Phase 3 alerts shipped, Phase 4 web UI underway:
 | `src/bourse/vinted.py` | Vinted.se scraper (JSON API via curl-cffi with Chrome TLS fingerprint) |
 | `tests/test_alerts.py` | Tests for alerts.py (Codex owned) |
 | `tests/test_blocket.py` | Blocket scraper unit tests (mocked `__NEXT_DATA__` fixtures) |
-| `tests/test_compare.py` | Confidence tier + arbitrage signal unit tests |
+| `tests/test_compare.py` | Confidence tier + arbitrage signal unit tests (sold-aware) |
+| `tests/test_ebay.py` | eBay scraper unit tests (mocked search-result HTML) |
 | `tests/test_normalize.py` | 16 brand + 18 size normalization tests |
 
 ---
@@ -59,9 +62,9 @@ Phase 2.5 complete, Phase 3 alerts shipped, Phase 4 web UI underway:
 ## Tech stack
 
 - **Python 3.11+** for everything
-- **httpx** — Plick, Tradera, and Blocket HTTP requests
-- **curl-cffi** — Vinted requests (Chrome TLS fingerprint to pass Cloudflare); also the Blocket fallback when Cloudflare returns 403
-- **selectolax** — HTML parsing for Plick, Tradera, and Blocket
+- **httpx** — Plick, Tradera, Blocket, and eBay HTTP requests
+- **curl-cffi** — Vinted requests (Chrome TLS fingerprint to pass Cloudflare); also the fallback for Blocket and eBay when they return 403
+- **selectolax** — HTML parsing for Plick, Tradera, Blocket, and eBay
 - **pydantic v2** — `Listing` model validation
 - **typer** — CLI
 - **polars** — analytics in the CLI report
@@ -341,6 +344,8 @@ DELETE /watchlist/{query}
 POST /scrape         → full scrape (all platforms, all queries, via subprocess)
 POST /scrape/new     → new listings only (stops per query when page is all known IDs)
 POST /scrape/update  → re-fetches all active listings to update price/likes/status
+POST /scrape/sold    → sold-price scrape: Tradera ended auctions + eBay LH_Sold;
+                       Plick sold-detection runs inside /scrape/update via the Såld badge
 ```
 
 After `POST /scrape/new`, `watchlist_runs` is upserted per query with exact new-listing count.  
@@ -400,18 +405,23 @@ GET /platforms/compare?q=...
         avg_price, median_price,
         p25, p75,                  -- quartiles for the spread bar
         min_price, max_price,
-        avg_likes,                 -- null when no platform exposes likes (e.g. Blocket)
+        avg_likes,                 -- null when no platform exposes likes (e.g. Blocket, eBay)
         avg_days_on_market,
         sample_confidence,         -- "low" <5, "medium" 5–15, "high" >15
+        sold_count,                -- # of status='sold' listings in last 90 days
+        median_sold_price,         -- median of those sold prices, null if none
         cheapest_3: [
           {id, title, url, image_url, condition, size, price_sek, likes}
         ]
       }
     ],
-    arbitrage_signal: {            -- null when fewer than 2 platforms have sample ≥5
+    arbitrage_signal: {            -- null when fewer than 2 platforms qualify
       buy_platform, sell_platform,
       buy_median_sek, sell_median_sek,
-      est_margin_sek,              -- revenue (sell median × (1 − sell_fee)) − cost (buy median + shipping)
+      buy_data_source,             -- always "listing" (you can only buy active stock)
+      sell_data_source,            -- "sold" when sold_count≥5 else "listing"
+      est_margin_sek,              -- revenue (sell × (1 − fee)) − cost (buy + shipping)
+                                   -- when buy=ebay add EBAY_SHIPPING_TO_SE; when sell=ebay subtract it
       est_margin_pct,
       gross_margin_sek             -- sell_median − buy_median, before fees + shipping
     } | null
@@ -529,6 +539,7 @@ All report data uses only active listings with sane prices (200–50,000 SEK).
 | Vinted | 1–2s random between requests | 2s → 4s → 8s → abort | JSON via curl-cffi |
 | Tradera | 2–4s random between requests | 2s → 4s → 8s → abort | `__NEXT_DATA__` via httpx |
 | Blocket | 2–4s random between requests | 2s → 4s → 8s → abort | `__NEXT_DATA__` via httpx, curl-cffi fallback on 403 |
+| eBay | 3–5s random (stricter — eBay is alert) | 2s → 4s → 8s → abort | `.s-item` HTML via selectolax, curl-cffi fallback on 403 |
 
 Never parallel. Always single-threaded.
 
@@ -659,9 +670,15 @@ BOURSE_API_URL=https://bourse-production.up.railway.app python3 -m bourse.seed_w
 
 ### Fees and shipping config
 
-`src/bourse/fees.py` defines `PLATFORM_FEES` (Plick 0%, Vinted 5%, Tradera 10%,
-Blocket 0%) and `SHIPPING_COST_SEK` (flat 79 kr). Edit this file to retune
-the net arbitrage signal — values are read at request time, no restart needed.
+`src/bourse/fees.py` defines all tunables for the arbitrage signal:
+- `PLATFORM_FEES` — Plick 0%, Vinted 5%, Tradera 10%, Blocket 0%, eBay 13%
+- `SHIPPING_COST_SEK` — flat 79 kr (domestic shipping baseline)
+- `USD_TO_SEK` — currency rate applied to eBay prices at ingest (default 10.5)
+- `EBAY_SHIPPING_TO_SE_SEK` — flat 250 kr added to cost when buying from eBay
+  and subtracted from revenue when selling on eBay
+
+Values are read at request time — edit the file and changes take effect
+without restart.
 
 ---
 

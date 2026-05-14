@@ -34,7 +34,8 @@ def init_db(path: Path = DB_PATH) -> None:
                 last_seen       TIMESTAMP NOT NULL,
                 status          TEXT NOT NULL DEFAULT 'active',  -- active | sold | removed | unknown
                 raw             TEXT,                       -- JSON blob for extra platform fields (location, category…)
-                image_url       TEXT                        -- thumbnail URL when scraper exposes one (Blocket+, others null)
+                image_url       TEXT,                       -- thumbnail URL when scraper exposes one
+                shipping_sek    INTEGER                     -- shipping cost to SE; only eBay populates this today
             );
 
             CREATE TABLE IF NOT EXISTS listing_snapshots (
@@ -54,6 +55,7 @@ def init_db(path: Path = DB_PATH) -> None:
         for ddl in (
             "ALTER TABLE listings ADD COLUMN posted_at TIMESTAMP",
             "ALTER TABLE listings ADD COLUMN image_url TEXT",
+            "ALTER TABLE listings ADD COLUMN shipping_sek INTEGER",
         ):
             try:
                 conn.execute(ddl)

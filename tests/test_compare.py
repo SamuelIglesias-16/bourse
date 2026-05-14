@@ -116,3 +116,85 @@ def test_arbitrage_signal_skips_platform_with_null_median() -> None:
     assert sig is not None
     assert sig["buy_platform"] == "plick"
     assert sig["sell_platform"] == "tradera"
+
+
+# ── Sold-aware tests ─────────────────────────────────────────────────────────
+
+
+def test_arbitrage_signal_uses_sold_median_when_available() -> None:
+    """When the sell side has ≥5 sold listings, use sold median (more honest)."""
+    platforms = [
+        {"platform": "plick", "count": 10, "median_price": 2000,
+         "sold_count": 0, "median_sold_price": None},
+        {"platform": "tradera", "count": 10, "median_price": 3000,
+         "sold_count": 12, "median_sold_price": 2600},  # sold for less than asked
+    ]
+    sig = compute_arbitrage_signal(platforms)
+    assert sig is not None
+    assert sig["sell_data_source"] == "sold"
+    assert sig["sell_median_sek"] == 2600  # NOT 3000
+    assert sig["buy_data_source"] == "listing"
+
+
+def test_arbitrage_signal_falls_back_to_listing_median_when_no_sold_data() -> None:
+    platforms = [
+        _platform("plick", count=10, median=2000),
+        _platform("vinted", count=10, median=2500),
+    ]
+    sig = compute_arbitrage_signal(platforms)
+    assert sig is not None
+    assert sig["sell_data_source"] == "listing"
+
+
+def test_arbitrage_signal_ebay_buy_adds_shipping() -> None:
+    from bourse.fees import EBAY_SHIPPING_TO_SE_SEK, PLATFORM_FEES, SHIPPING_COST_SEK
+    platforms = [
+        _platform("ebay", count=20, median=1500),
+        {"platform": "tradera", "count": 10, "median_price": 2800,
+         "sold_count": 8, "median_sold_price": 2500},
+    ]
+    sig = compute_arbitrage_signal(platforms)
+    assert sig is not None
+    assert sig["buy_platform"] == "ebay"
+    assert sig["sell_platform"] == "tradera"
+    # Cost = buy_median + base shipping + EBAY shipping
+    expected_cost = 1500 + SHIPPING_COST_SEK + EBAY_SHIPPING_TO_SE_SEK
+    # Revenue = sold_median × (1 − tradera fee 0.10)
+    expected_revenue = 2500 * (1.0 - PLATFORM_FEES["tradera"])
+    assert sig["est_margin_sek"] == round(expected_revenue - expected_cost)
+
+
+def test_arbitrage_signal_ebay_sell_subtracts_shipping_from_revenue() -> None:
+    from bourse.fees import EBAY_SHIPPING_TO_SE_SEK, PLATFORM_FEES, SHIPPING_COST_SEK
+    platforms = [
+        _platform("plick", count=10, median=1000),
+        {"platform": "ebay", "count": 10, "median_price": 2500,
+         "sold_count": 10, "median_sold_price": 2300},
+    ]
+    sig = compute_arbitrage_signal(platforms)
+    assert sig is not None
+    assert sig["buy_platform"] == "plick"
+    assert sig["sell_platform"] == "ebay"
+    expected_revenue = 2300 * (1.0 - PLATFORM_FEES["ebay"]) - EBAY_SHIPPING_TO_SE_SEK
+    expected_cost = 1000 + SHIPPING_COST_SEK
+    assert sig["est_margin_sek"] == round(expected_revenue - expected_cost)
+
+
+def test_arbitrage_signal_buy_side_never_uses_sold_data() -> None:
+    """You can't buy items that are already sold — buy side must use listing data only.
+
+    Plick has heaps of sold data but a thin listing sample, so it's not
+    eligible as the buy side; it can still be the sell side via its sold
+    median.
+    """
+    platforms = [
+        {"platform": "plick", "count": 2, "median_price": 1500,  # too low listing sample
+         "sold_count": 20, "median_sold_price": 1200},
+        _platform("tradera", count=10, median=2500),
+    ]
+    sig = compute_arbitrage_signal(platforms)
+    assert sig is not None
+    assert sig["buy_platform"] == "tradera"
+    assert sig["sell_platform"] == "plick"
+    assert sig["sell_data_source"] == "sold"
+    assert sig["buy_data_source"] == "listing"

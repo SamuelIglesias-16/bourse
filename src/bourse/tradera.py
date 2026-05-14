@@ -114,6 +114,13 @@ def _search_url(query: str, page: int) -> str:
     return f"{BASE_URL}/search?{params}"
 
 
+def _ended_search_url(query: str, page: int) -> str:
+    params = urllib.parse.urlencode(
+        {"q": query, "paging": str(page), "status": "ended", "sortBy": "EndDateOldest"}
+    )
+    return f"{BASE_URL}/search?{params}"
+
+
 def _extract_next_data(html: str) -> dict[str, Any]:
     tree = HTMLParser(html)
     script = tree.css_first("script#__NEXT_DATA__")
@@ -327,6 +334,44 @@ def scrape_query_new_only(query: str, known_ids: set[str], max_pages: int = 20) 
                 break
 
     return result
+
+
+def scrape_query_ended(query: str, pages: int = 3) -> list[Listing]:
+    """Scrape ENDED Tradera auctions for *query* — returns Listing rows pre-tagged sold.
+
+    Items with ``totalBids == 0`` are dropped (auctions that ended without a sale
+    have no genuine sold price). Items with bids are returned with
+    ``status_override = 'sold'`` and the final bid as ``price_sek``.
+    """
+    now = datetime.now()
+    listings: list[Listing] = []
+
+    with httpx.Client(
+        follow_redirects=True,
+        headers={"Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8"},
+    ) as client:
+        for page in range(1, pages + 1):
+            url = _ended_search_url(query, page)
+            logger.info("Fetching Tradera ENDED page %d for %r", page, query)
+            try:
+                html = _fetch(client, url)
+            except RuntimeError as exc:
+                logger.error("Aborting ended scrape: %s", exc)
+                break
+            page_listings, page_count = _parse_search_page(
+                html, position_offset=len(listings), now=now
+            )
+            if not page_listings:
+                break
+            # Keep only ones with at least 1 bid AND a sane price; mark as sold.
+            for listing in page_listings:
+                if listing.likes is None or listing.likes < 1:
+                    continue
+                listings.append(listing.model_copy(update={"status_override": "sold"}))
+            if page >= min(pages, int(page_count)):
+                break
+
+    return listings
 
 
 def fetch_listing(listing_id: str, url: str) -> tuple[int | None, int | None]:

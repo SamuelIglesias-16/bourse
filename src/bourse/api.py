@@ -20,6 +20,7 @@ from bourse.scrape_tasks import (
     pg_read,
     run_scrape_new,
     run_scrape_update,
+    run_scrape_sold,
     refresh_opportunities,
     ensure_watchlist_runs_table,
     ensure_watchlist_table,
@@ -123,11 +124,18 @@ def trigger_scrape_update(bg: BackgroundTasks) -> dict[str, str]:
     return {"status": "accepted", "message": "Scrape-update job started — rechecks existing active listings"}
 
 
+@app.post("/scrape/sold", status_code=202)
+def trigger_scrape_sold(bg: BackgroundTasks) -> dict[str, str]:
+    bg.add_task(run_scrape_sold)
+    return {"status": "accepted", "message": "Sold-price scrape started — Tradera ended auctions + eBay LH_Sold"}
+
+
 PLATFORM_BASE_URLS = {
     "plick": "https://www.plick.se",
     "vinted": "https://www.vinted.se",
     "tradera": "https://www.tradera.com",
     "blocket": "https://www.blocket.se",
+    "ebay": "https://www.ebay.com",
 }
 
 
@@ -470,6 +478,45 @@ def get_platforms_compare(
          ORDER BY platform, rn
     """
 
+    # Sold-side aggregates: median of the most recent snapshot per *sold* listing,
+    # last 90 days. Independent from the active aggregates above so listing
+    # counts and sold counts don't shadow each other.
+    sold_clauses = [
+        "l.status = 'sold'",
+        f"lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}",
+        "l.last_seen >= NOW() - INTERVAL '90 days'",
+        f"({keyword_clauses})",
+    ]
+    sold_params: list[Any] = []
+    for kw in keywords:
+        pat = f"%{kw}%"
+        sold_params.extend([pat, pat])
+    if condition:
+        sold_clauses.append("LOWER(COALESCE(l.condition, '')) = %s")
+        sold_params.append(condition.lower())
+    if size:
+        sold_clauses.append("LOWER(COALESCE(l.size, '')) = %s")
+        sold_params.append(size.lower())
+    if brand:
+        sold_clauses.append("LOWER(COALESCE(l.brand, '')) = %s")
+        sold_params.append(brand.lower())
+    sold_where = " AND ".join(sold_clauses)
+
+    sold_sql = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (listing_id) listing_id, price_sek
+              FROM listing_snapshots ORDER BY listing_id, scraped_at DESC
+        )
+        SELECT
+            l.platform,
+            COUNT(*) AS sold_count,
+            (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lt.price_sek))::INTEGER AS median_sold_price
+          FROM listings l
+          JOIN latest lt ON lt.listing_id = l.listing_id
+         WHERE {sold_where}
+         GROUP BY l.platform
+    """
+
     try:
         with pg_read() as conn:
             with conn.cursor() as cur:
@@ -477,6 +524,8 @@ def get_platforms_compare(
                 aggregate_rows = [dict(r) for r in cur.fetchall()]
                 cur.execute(cheapest_sql, base_params)
                 cheap_rows = [dict(r) for r in cur.fetchall()]
+                cur.execute(sold_sql, sold_params)
+                sold_rows = {r["platform"]: dict(r) for r in cur.fetchall()}
     except Exception:
         logger.exception("GET /platforms/compare query failed")
         raise HTTPException(500, "Database query failed — check server logs")
@@ -497,9 +546,11 @@ def get_platforms_compare(
         )
 
     platforms: list[dict[str, Any]] = []
+    seen_platforms: set[str] = set()
     for row in aggregate_rows:
         avg_likes = row["avg_likes"]
         avg_dom = row["avg_days_on_market"]
+        sold = sold_rows.get(row["platform"], {})
         platforms.append(
             {
                 "platform": row["platform"],
@@ -513,7 +564,29 @@ def get_platforms_compare(
                 "avg_likes": round(float(avg_likes), 1) if avg_likes is not None else None,
                 "avg_days_on_market": round(float(avg_dom), 1) if avg_dom is not None else None,
                 "sample_confidence": confidence_tier(int(row["count"])),
+                "sold_count": int(sold.get("sold_count") or 0),
+                "median_sold_price": int(sold["median_sold_price"]) if sold.get("median_sold_price") is not None else None,
                 "cheapest_3": cheapest_by_platform.get(row["platform"], []),
+            }
+        )
+        seen_platforms.add(row["platform"])
+
+    # Platforms with only sold data (no current active listings) still belong in the response.
+    for platform_name, sold in sold_rows.items():
+        if platform_name in seen_platforms:
+            continue
+        platforms.append(
+            {
+                "platform": platform_name,
+                "count": 0,
+                "avg_price": None, "median_price": None,
+                "p25": None, "p75": None,
+                "min_price": None, "max_price": None,
+                "avg_likes": None, "avg_days_on_market": None,
+                "sample_confidence": "low",
+                "sold_count": int(sold["sold_count"] or 0),
+                "median_sold_price": int(sold["median_sold_price"]) if sold.get("median_sold_price") is not None else None,
+                "cheapest_3": [],
             }
         )
 
