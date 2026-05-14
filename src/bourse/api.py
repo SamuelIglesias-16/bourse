@@ -149,8 +149,17 @@ def get_listings(
     min_price: Optional[int] = None,
     max_price: Optional[int] = None,
     sane_prices: bool = False,
+    status: str = "active",  # active | sold | all
 ) -> list[dict[str, Any]]:
-    conds = ["l.status = 'active'"]
+    status = (status or "active").lower()
+    if status not in {"active", "sold", "all"}:
+        raise HTTPException(400, "status must be one of: active, sold, all")
+    conds: list[str] = []
+    if status == "active":
+        conds.append("l.status = 'active'")
+    elif status == "sold":
+        conds.append("l.status = 'sold'")
+    # status="all" → no filter
     params: list[Any] = []
     if platform:
         conds.append("l.platform = %s")
@@ -167,6 +176,8 @@ def get_listings(
     if sane_prices:
         conds.append(f"lt.price_sek BETWEEN {PRICE_MIN} AND {PRICE_MAX}")
 
+    where_clause = " AND ".join(conds) if conds else "TRUE"
+    order_clause = "l.last_seen DESC" if status == "sold" else "l.first_seen DESC"
     sql = f"""
         WITH latest AS (
             SELECT DISTINCT ON (listing_id) listing_id, price_sek, likes
@@ -176,10 +187,10 @@ def get_listings(
                COALESCE(l.brand, '—') AS brand, l.size, l.condition,
                lt.price_sek, COALESCE(lt.likes, 0) AS likes, l.status,
                (EXTRACT(EPOCH FROM NOW() - l.first_seen) / 86400)::INTEGER AS days_on_market,
-               l.first_seen, l.last_seen
+               l.first_seen, l.last_seen, l.image_url
           FROM listings l JOIN latest lt ON lt.listing_id = l.listing_id
-         WHERE {" AND ".join(conds)}
-         ORDER BY l.first_seen DESC
+         WHERE {where_clause}
+         ORDER BY {order_clause}
     """
     try:
         with pg_read() as conn:
