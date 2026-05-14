@@ -207,11 +207,26 @@ def get_listings(
         r["last_seen"] = r["last_seen"].isoformat() if r["last_seen"] else None
         if not r.get("url"):
             r["url"] = PLATFORM_BASE_URLS.get(r["platform"], "")
+        r["sold_quality"] = _sold_quality(r) if r.get("status") == "sold" else None
 
     if category:
         rows = [r for r in rows if r["category"] == category]
 
     return rows
+
+
+def _sold_quality(row: dict[str, Any]) -> str:
+    """Classify how reliable a sold price is for this row.
+
+    'confirmed': real transaction price (Tradera winning bid, eBay LH_Sold).
+    'estimated': asking price at time of sale (Plick Såld — no bidding/record).
+    """
+    platform = (row.get("platform") or "").lower()
+    if platform in ("tradera", "ebay"):
+        return "confirmed"
+    if platform == "plick":
+        return "estimated"
+    return "estimated"
 
 
 def _fetch_keyword_listings(q: str) -> list[dict[str, Any]]:
