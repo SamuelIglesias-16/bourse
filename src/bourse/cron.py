@@ -19,6 +19,9 @@ def main() -> None:
         elif job == "scrape-update":
             from bourse.scrape_tasks import run_scrape_update
             run_scrape_update()
+        elif job == "scrape-sold":
+            from bourse.scrape_tasks import run_scrape_sold
+            run_scrape_sold()
         else:
             print(f"Unknown job: {job}", file=sys.stderr)
             sys.exit(1)

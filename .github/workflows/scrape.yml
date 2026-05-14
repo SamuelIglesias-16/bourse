@@ -1,0 +1,57 @@
+name: Scheduled scrape
+
+# Cron times are UTC. Adjust to taste.
+#   scrape-new every 45 min — pulls fresh listings
+#   scrape-update every 2 h — re-checks active listings + Plick Såld detection
+#   scrape-sold  every 6 h  — Tradera ended auctions + eBay LH_Sold
+# You can also run any of them on-demand via the "workflow_dispatch" button
+# in the Actions tab.
+
+on:
+  schedule:
+    - cron: "*/45 * * * *"      # scrape-new — every 45 minutes
+    - cron: "13 */2 * * *"      # scrape-update — every 2 hours at :13
+    - cron: "27 */6 * * *"      # scrape-sold  — every 6 hours at :27
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Which job to run"
+        required: true
+        default: "scrape-new"
+        type: choice
+        options: [scrape-new, scrape-update, scrape-sold]
+
+env:
+  BOURSE_API_URL: https://bourse-production.up.railway.app
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pick endpoint
+        id: pick
+        run: |
+          MIN=$(date -u +%M)
+          # workflow_dispatch overrides the schedule
+          if [[ -n "${{ github.event.inputs.job }}" ]]; then
+            JOB="${{ github.event.inputs.job }}"
+          elif [[ "$MIN" == "27" ]]; then
+            JOB="scrape-sold"
+          elif [[ "$MIN" == "13" ]]; then
+            JOB="scrape-update"
+          else
+            JOB="scrape-new"
+          fi
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          case "$JOB" in
+            scrape-new)    PATH_=/scrape/new ;;
+            scrape-update) PATH_=/scrape/update ;;
+            scrape-sold)   PATH_=/scrape/sold ;;
+          esac
+          echo "path=$PATH_" >> "$GITHUB_OUTPUT"
+
+      - name: POST ${{ steps.pick.outputs.path }}
+        run: |
+          echo "Triggering ${{ steps.pick.outputs.job }} on $BOURSE_API_URL${{ steps.pick.outputs.path }}"
+          curl -sS -X POST -f "$BOURSE_API_URL${{ steps.pick.outputs.path }}" | tee /tmp/resp.json
