@@ -255,6 +255,85 @@ def _platform_aggregates_for_query(cur: Any, query: str) -> list[dict[str, Any]]
     return [dict(r) for r in cur.fetchall()]
 
 
+def backfill_vinted_sold() -> dict[str, int]:
+    """Reclassify already-'removed' Vinted listings as 'sold' with estimated price.
+
+    Vinted items rarely get deleted for moderation reasons — the vast majority
+    of disappearances are sales. Before this function existed, our update flow
+    couldn't distinguish 'sold' from 'removed' for Vinted, so we blanket-marked
+    them 'removed'. This one-shot reclassification:
+
+    1. Finds every Vinted listing with status='removed'
+    2. Flips status to 'sold'
+    3. Synthesizes a final snapshot priced at ``last_price × 0.9`` (10% discount
+       — Vinted negotiation is typical) so the row appears in /listings?status=sold
+
+    Safe to re-run; only inserts an estimated snapshot if none has already been
+    written at-or-after the listing's last_seen timestamp.
+    """
+    try:
+        with pg_write() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT l.listing_id, l.last_seen,
+                              (SELECT price_sek FROM listing_snapshots
+                                WHERE listing_id = l.listing_id
+                                ORDER BY scraped_at DESC LIMIT 1) AS last_price
+                         FROM listings l
+                        WHERE l.platform = 'vinted' AND l.status = 'removed'"""
+                )
+                rows = list(cur.fetchall())
+
+                reclassified = 0
+                snapshots_added = 0
+                skipped_no_price = 0
+
+                for r in rows:
+                    listing_id = r["listing_id"]
+                    last_seen = r["last_seen"]
+                    last_price = r["last_price"]
+
+                    cur.execute(
+                        "UPDATE listings SET status = 'sold' WHERE listing_id = %s",
+                        (listing_id,),
+                    )
+                    reclassified += 1
+
+                    if last_price is None:
+                        skipped_no_price += 1
+                        continue
+
+                    estimated = int(round(last_price * (1 - SOLD_PRICE_ESTIMATE_DISCOUNT)))
+
+                    cur.execute(
+                        """SELECT COUNT(*) AS n FROM listing_snapshots
+                            WHERE listing_id = %s AND scraped_at >= %s""",
+                        (listing_id, last_seen),
+                    )
+                    already = cur.fetchone()["n"]
+                    if already == 0:
+                        cur.execute(
+                            """INSERT INTO listing_snapshots
+                                   (listing_id, scraped_at, price_sek, likes, views, position_in_search)
+                                VALUES (%s,%s,%s,NULL,NULL,NULL)""",
+                            (listing_id, last_seen, estimated),
+                        )
+                        snapshots_added += 1
+
+        logger.info(
+            "backfill_vinted_sold: reclassified=%d snapshots_added=%d skipped_no_price=%d",
+            reclassified, snapshots_added, skipped_no_price,
+        )
+        return {
+            "reclassified": reclassified,
+            "snapshots_added": snapshots_added,
+            "skipped_no_price": skipped_no_price,
+        }
+    except Exception:
+        logger.exception("backfill_vinted_sold failed")
+        return {"reclassified": 0, "snapshots_added": 0, "skipped_no_price": 0}
+
+
 def refresh_opportunities() -> dict[str, int]:
     """Recompute the arbitrage signal for every watchlist query and persist.
 
@@ -558,11 +637,32 @@ def _mark_removed_pg(listing_id: str, now: datetime) -> None:
             )
 
 
+SOLD_PRICE_ESTIMATE_DISCOUNT = 0.10  # 10% off last asking price for sold-without-final-price
+
+
 def _mark_sold_pg(listing_id: str, price_sek: int | None, now: datetime) -> None:
-    """Flip a listing to status='sold' and (when known) record the final-sale snapshot."""
+    """Flip a listing to status='sold' and record a final-sale snapshot.
+
+    When ``price_sek`` is None (e.g. Vinted 410 — we know it sold but have no
+    transaction price), fall back to ``last known snapshot price × 0.9``.
+    The result is still inserted as a snapshot so the row shows up in the Sold
+    tab with a plausible price; ``sold_quality='estimated'`` on the API side
+    makes the uncertainty visible.
+    """
     try:
         with pg_write() as conn:
             with conn.cursor() as cur:
+                # If no explicit price, estimate from last snapshot
+                if price_sek is None:
+                    cur.execute(
+                        "SELECT price_sek FROM listing_snapshots WHERE listing_id = %s ORDER BY scraped_at DESC LIMIT 1",
+                        (listing_id,),
+                    )
+                    row = cur.fetchone()
+                    last_price = row["price_sek"] if row else None
+                    if last_price is not None:
+                        price_sek = int(round(last_price * (1 - SOLD_PRICE_ESTIMATE_DISCOUNT)))
+
                 cur.execute(
                     "UPDATE listings SET status = 'sold', last_seen = %s WHERE listing_id = %s",
                     (now, listing_id),
@@ -576,6 +676,13 @@ def _mark_sold_pg(listing_id: str, price_sek: int | None, now: datetime) -> None
         logger.warning("Postgres unreachable (%s) — SQLite fallback: marking %s sold", exc, listing_id)
         from bourse.db import get_connection, DB_PATH
         with get_connection(DB_PATH) as conn:
+            if price_sek is None:
+                row = conn.execute(
+                    "SELECT price_sek FROM listing_snapshots WHERE listing_id = ? ORDER BY scraped_at DESC LIMIT 1",
+                    (listing_id,),
+                ).fetchone()
+                if row is not None:
+                    price_sek = int(round(row["price_sek"] * (1 - SOLD_PRICE_ESTIMATE_DISCOUNT)))
             conn.execute(
                 "UPDATE listings SET status = 'sold', last_seen = ? WHERE listing_id = ?",
                 (now.isoformat(), listing_id),
@@ -633,7 +740,7 @@ def run_scrape_update() -> None:
                 if listing_id.startswith("plick:"):
                     price, likes, is_gone, is_sold = plick.fetch_listing(url)
                 elif listing_id.startswith("vinted:"):
-                    price, likes, is_gone = vinted.fetch_listing(listing_id)
+                    price, likes, is_gone, is_sold = vinted.fetch_listing(listing_id)
                 elif listing_id.startswith("tradera:"):
                     if not _tradera_available:
                         logger.debug("scrape/update: tradera unavailable, skipping %s", listing_id)

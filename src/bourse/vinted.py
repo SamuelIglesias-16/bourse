@@ -248,8 +248,20 @@ def scrape_query_new_only(query: str, known_ids: set[str], max_pages: int = 20) 
     return result
 
 
-def fetch_listing(listing_id: str) -> tuple[int | None, int | None, bool]:
-    """Re-fetch a single Vinted item via the API. Returns (price_sek, likes, is_gone)."""
+def fetch_listing(listing_id: str) -> tuple[int | None, int | None, bool, bool]:
+    """Re-fetch a single Vinted item via the API.
+
+    Returns ``(price_sek, likes, is_gone, is_sold)``.
+
+    Vinted handles disappearance two ways:
+    - **410 Gone** → typically a sold item (Vinted's most common signal)
+    - **404 Not Found** → seller deleted or moderation removed
+    - **200 OK** with a non-active status field → sold while page is still up
+
+    For 410 we return ``is_sold=True`` with no price; the caller estimates
+    the sold price from the last known snapshot. For 404 we return
+    ``is_gone=True``.
+    """
     item_id = listing_id.removeprefix("vinted:")
     url = f"{BASE_URL}/api/v2/items/{item_id}"
     with cf_requests.Session(impersonate=CF_IMPERSONATE) as session:
@@ -263,13 +275,30 @@ def fetch_listing(listing_id: str) -> tuple[int | None, int | None, bool]:
             )
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
-        if resp.status_code in (404, 410):
-            return None, None, True
+        if resp.status_code == 404:
+            return None, None, True, False
+        if resp.status_code == 410:
+            return None, None, False, True
         resp.raise_for_status()
         data = resp.json()
     item = data.get("item", {})
     if not item:
-        return None, None, True
+        # Empty payload usually means the item is gone — treat as sold
+        # (more useful default than 'removed' given Vinted's ratio).
+        return None, None, False, True
+
+    # Status sniff: Vinted exposes the active/sold state under several keys
+    # depending on API version. Check the common ones defensively.
+    is_sold = False
+    if item.get("is_closed") is True or item.get("is_sold") is True:
+        is_sold = True
+    status_id = item.get("status_id")
+    if isinstance(status_id, int) and status_id in (6, 7):
+        # Empirically: 6 = sold, 7 = closed
+        is_sold = True
+    if item.get("is_visible") is False or item.get("can_buy") is False:
+        is_sold = True
+
     raw = item.get("price", {})
     price_str = raw.get("amount") if isinstance(raw, dict) else str(raw)
     try:
@@ -277,4 +306,9 @@ def fetch_listing(listing_id: str) -> tuple[int | None, int | None, bool]:
     except (TypeError, ValueError):
         price_sek = None
     likes = item.get("favourite_count")
-    return price_sek, int(likes) if likes is not None else None, False
+    return (
+        price_sek,
+        int(likes) if likes is not None else None,
+        False,
+        is_sold,
+    )

@@ -22,6 +22,7 @@ from bourse.scrape_tasks import (
     run_scrape_update,
     run_scrape_sold,
     refresh_opportunities,
+    backfill_vinted_sold,
     ensure_watchlist_runs_table,
     ensure_watchlist_table,
     ensure_listing_columns,
@@ -219,13 +220,12 @@ def _sold_quality(row: dict[str, Any]) -> str:
     """Classify how reliable a sold price is for this row.
 
     'confirmed': real transaction price (Tradera winning bid, eBay LH_Sold).
-    'estimated': asking price at time of sale (Plick Såld — no bidding/record).
+    'estimated': asking price at sale time (Plick Såld badge) or asking-price
+                 × 0.9 estimate (Vinted, which doesn't expose final price).
     """
     platform = (row.get("platform") or "").lower()
     if platform in ("tradera", "ebay"):
         return "confirmed"
-    if platform == "plick":
-        return "estimated"
     return "estimated"
 
 
@@ -749,6 +749,17 @@ def trigger_opportunities_refresh(bg: BackgroundTasks) -> dict[str, str]:
     """Recompute the arbitrage_opportunities table without re-scraping."""
     bg.add_task(refresh_opportunities)
     return {"status": "accepted", "message": "Opportunities recompute started in background"}
+
+
+@app.post("/admin/backfill-vinted-sold")
+def trigger_backfill_vinted_sold() -> dict[str, Any]:
+    """Reclassify already-'removed' Vinted listings as 'sold' with estimated price.
+
+    Synchronous (returns once done) — typically completes in a few seconds even
+    on a large dataset. Safe to re-run; idempotent on snapshot insertion.
+    """
+    result = backfill_vinted_sold()
+    return {"status": "ok", **result}
 
 
 # ── report ───────────────────────────────────────────────────────────────────
