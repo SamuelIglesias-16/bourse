@@ -21,39 +21,38 @@ def confidence_tier(count: int) -> str:
 
 
 def compute_arbitrage_signal(platforms: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Pick the (buy, sell) pair across platforms maximizing net margin.
+    """Pick the (buy, sell) pair across platforms maximizing net median spread.
 
-    Each platform dict must include: ``platform``, ``count``, ``median_price``,
-    and ``cheapest_3`` (a list whose first element exposes ``price_sek``).
-    Both sides of the pair must have ``count >= 5`` (medium+ confidence).
-    Net margin deducts the sell platform's fee plus a flat shipping cost.
-    Returns ``None`` when fewer than two platforms qualify.
+    Both sides use the median price — this models a *sustainable* arbitrage
+    opportunity ("if you buy at the typical price here and sell at the typical
+    price there"), not a lucky single-listing deal. Both sides of the pair
+    must have ``count >= 5`` (medium+ confidence). Net margin deducts the
+    sell platform's fee plus a flat shipping cost. Returns ``None`` when
+    fewer than two platforms qualify.
     """
     eligible = [
         p for p in platforms
-        if p.get("count", 0) >= 5
-        and p.get("cheapest_3")
-        and p.get("median_price") is not None
+        if p.get("count", 0) >= 5 and p.get("median_price") is not None
     ]
     if len(eligible) < 2:
         return None
 
     best: dict[str, Any] | None = None
     for buy in eligible:
-        cheapest_buy = buy["cheapest_3"][0]["price_sek"]
+        buy_median = buy["median_price"]
         for sell in eligible:
             if sell["platform"] == buy["platform"]:
                 continue
             sell_fee = PLATFORM_FEES.get(sell["platform"], 0.0)
             sell_median = sell["median_price"]
             revenue = sell_median * (1.0 - sell_fee)
-            cost = cheapest_buy + SHIPPING_COST_SEK
+            cost = buy_median + SHIPPING_COST_SEK
             est_margin = revenue - cost
-            gross_margin = sell_median - cheapest_buy
+            gross_margin = sell_median - buy_median
             candidate = {
                 "buy_platform": buy["platform"],
                 "sell_platform": sell["platform"],
-                "buy_price_sek": cheapest_buy,
+                "buy_median_sek": buy_median,
                 "sell_median_sek": sell_median,
                 "est_margin_sek": round(est_margin),
                 "est_margin_pct": round((est_margin / cost) * 100, 1) if cost > 0 else None,

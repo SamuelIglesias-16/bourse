@@ -395,10 +395,10 @@ GET /platforms/compare?q=...
     ],
     arbitrage_signal: {            -- null when fewer than 2 platforms have sample ≥5
       buy_platform, sell_platform,
-      buy_price_sek, sell_median_sek,
-      est_margin_sek,              -- revenue (sell median × (1 − sell_fee)) − cost (cheapest_buy + shipping)
+      buy_median_sek, sell_median_sek,
+      est_margin_sek,              -- revenue (sell median × (1 − sell_fee)) − cost (buy median + shipping)
       est_margin_pct,
-      gross_margin_sek             -- sell_median − cheapest_buy, before fees + shipping
+      gross_margin_sek             -- sell_median − buy_median, before fees + shipping
     } | null
   }
 ```
@@ -406,8 +406,11 @@ GET /platforms/compare?q=...
 Same keyword logic as `/listings/by-query`: AND match for ≥3 words, OR for 1–2.
 Filters to active listings + sane prices + first_seen within `days`. Returns one
 entry per platform with at least one match; the frontend can hide low-confidence
-cells. Arbitrage signal evaluates all ordered pairs (up to 12 across 4 platforms)
-and picks the highest net margin. Fees + shipping come from `src/bourse/fees.py`:
+cells. The arbitrage signal compares **median-to-median** across platforms —
+this models a sustainable spread ("typical buy price → typical sell price")
+rather than a lucky single-listing deal. All ordered pairs (up to 12 across 4
+platforms) are evaluated and the highest net margin is returned.
+Fees + shipping come from `src/bourse/fees.py`:
 
 ```python
 PLATFORM_FEES = {"plick": 0.0, "vinted": 0.05, "tradera": 0.10, "blocket": 0.0}
