@@ -20,9 +20,11 @@ from bourse.scrape_tasks import (
     pg_read,
     run_scrape_new,
     run_scrape_update,
+    refresh_opportunities,
     ensure_watchlist_runs_table,
     ensure_watchlist_table,
     ensure_listing_columns,
+    ensure_opportunities_table,
     pg_read_watchlist,
     pg_watchlist_add,
     pg_watchlist_remove,
@@ -42,6 +44,7 @@ try:
     ensure_watchlist_runs_table()
     ensure_watchlist_table()
     ensure_listing_columns()
+    ensure_opportunities_table()
 except Exception:
     logger.warning("Startup: could not ensure watchlist tables — DB may not be ready yet")
 
@@ -583,6 +586,70 @@ def get_platforms_compare_history(q: str, days: int = 30) -> dict[str, Any]:
             for platform, points in by_platform.items()
         ],
     }
+
+
+@app.get("/platforms/opportunities")
+def get_platforms_opportunities(
+    limit: int = 20,
+    min_margin_pct: Optional[float] = None,
+) -> dict[str, Any]:
+    """Top arbitrage opportunities across the watchlist, sorted by est_margin_sek desc.
+
+    The underlying table is refreshed automatically after every scrape; trigger a
+    manual recompute with POST /platforms/opportunities/refresh.
+    """
+    if limit <= 0 or limit > 200:
+        raise HTTPException(400, "limit must be in 1..200")
+
+    sql = "SELECT * FROM arbitrage_opportunities"
+    conds: list[str] = []
+    params: list[Any] = []
+    if min_margin_pct is not None:
+        conds.append("est_margin_pct >= %s")
+        params.append(min_margin_pct)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY est_margin_sek DESC LIMIT %s"
+    params.append(limit)
+
+    try:
+        with pg_read() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = [dict(r) for r in cur.fetchall()]
+                cur.execute("SELECT MAX(computed_at) AS latest FROM arbitrage_opportunities")
+                latest_row = cur.fetchone()
+    except Exception:
+        logger.exception("GET /platforms/opportunities query failed")
+        raise HTTPException(500, "Database query failed — check server logs")
+
+    latest = latest_row["latest"] if latest_row else None
+    return {
+        "computed_at": latest.isoformat() if latest else None,
+        "count": len(rows),
+        "opportunities": [
+            {
+                "query": r["query"],
+                "buy_platform": r["buy_platform"],
+                "sell_platform": r["sell_platform"],
+                "buy_median_sek": int(r["buy_median_sek"]),
+                "sell_median_sek": int(r["sell_median_sek"]),
+                "est_margin_sek": int(r["est_margin_sek"]),
+                "est_margin_pct": float(r["est_margin_pct"]) if r["est_margin_pct"] is not None else None,
+                "gross_margin_sek": int(r["gross_margin_sek"]),
+                "total_listings": int(r["total_listings"]),
+                "computed_at": r["computed_at"].isoformat() if r["computed_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/platforms/opportunities/refresh", status_code=202)
+def trigger_opportunities_refresh(bg: BackgroundTasks) -> dict[str, str]:
+    """Recompute the arbitrage_opportunities table without re-scraping."""
+    bg.add_task(refresh_opportunities)
+    return {"status": "accepted", "message": "Opportunities recompute started in background"}
 
 
 # ── report ───────────────────────────────────────────────────────────────────

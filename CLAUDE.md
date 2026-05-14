@@ -158,6 +158,21 @@ CREATE TABLE IF NOT EXISTS watchlist (
 );
 -- Seeded from watchlist.txt on first boot (when table is empty).
 -- This is the source of truth on Railway; watchlist.txt is kept as a fallback.
+
+CREATE TABLE IF NOT EXISTS arbitrage_opportunities (
+    query            TEXT PRIMARY KEY,
+    buy_platform     TEXT NOT NULL,
+    sell_platform    TEXT NOT NULL,
+    buy_median_sek   INTEGER NOT NULL,
+    sell_median_sek  INTEGER NOT NULL,
+    est_margin_sek   INTEGER NOT NULL,
+    est_margin_pct   REAL,
+    gross_margin_sek INTEGER NOT NULL,
+    total_listings   INTEGER NOT NULL,
+    computed_at      TIMESTAMP NOT NULL
+);
+-- Refreshed at the tail of each run_scrape_new / run_scrape_update via
+-- refresh_opportunities(). Queries with no eligible signal are deleted.
 ```
 
 ---
@@ -430,6 +445,29 @@ GET /platforms/compare/history?q=...&days=30
 
 Daily median prices grouped by date + platform from `listing_snapshots`. Powers
 the 30-day spark line on each platform column in the redesigned `/compare` page.
+
+```
+GET /platforms/opportunities?limit=20&min_margin_pct=10
+→ {
+    computed_at: "ISO timestamp of latest row",
+    count: int,
+    opportunities: [
+      {query, buy_platform, sell_platform,
+       buy_median_sek, sell_median_sek,
+       est_margin_sek, est_margin_pct, gross_margin_sek,
+       total_listings, computed_at}
+    ]
+  }
+
+POST /platforms/opportunities/refresh
+→ 202 — kicks off recompute in background
+```
+
+Holds the latest median→median arbitrage signal for **every** watchlist query,
+sorted by `est_margin_sek` desc. Recomputed automatically at the end of every
+`run_scrape_new()` and `run_scrape_update()` run; manually triggerable via the
+POST endpoint. Queries with no eligible signal (fewer than 2 platforms at
+medium+ confidence) are dropped from the table.
 
 ### Report
 
